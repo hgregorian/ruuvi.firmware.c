@@ -289,6 +289,7 @@ RUUVI_PRJ_SOURCES= \
   $(PROJ_DIR)/main.c \
   $(PROJ_DIR)/run_integration_tests.c \
   $(PROJ_DIR)/app_button.c \
+  $(PROJ_DIR)/app_cart_motion.c \
   $(PROJ_DIR)/app_comms.c \
   $(PROJ_DIR)/app_dataformats.c \
   $(PROJ_DIR)/app_heartbeat.c \

@@ -6,6 +6,7 @@
  */
 
 #include "app_config.h"
+#include "app_cart_motion.h"
 #include "app_comms.h"
 #include "app_dataformats.h"
 #include "app_heartbeat.h"
@@ -93,6 +94,7 @@ void heartbeat (void * p_event, uint16_t event_size)
     float data_values[rd_sensor_data_fieldcount (&data)];
     data.data = data_values;
     app_sensor_get (&data);
+    app_cart_motion_on_sample (&data);
     // Sensor read takes a long while, indicate activity once data is read.
     app_led_activity_signal (true);
     m_dataformat_state = app_dataformat_next (m_dataformats_enabled, m_dataformat_state);

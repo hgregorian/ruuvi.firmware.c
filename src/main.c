@@ -11,6 +11,7 @@
  */
 #include "app_config.h"
 #include "app_button.h"
+#include "app_cart_motion.h"
 #include "app_comms.h"
 #include "app_heartbeat.h"
 #include "app_led.h"
@@ -80,12 +81,14 @@ void setup (void)
     err_code |= app_dc_dc_init();
     err_code |= app_sensor_init();
     err_code |= app_log_init();
-    // Allow fail on boards which do not have accelerometer.
-    (void) app_sensor_acc_thr_set (&motion_threshold);
     err_code |= app_comms_init (APP_LOCKED_AT_BOOT);
     err_code |= app_sensor_vdd_sample();
     err_code |= app_heartbeat_init();
+    err_code |= app_cart_motion_init();
     err_code |= app_heartbeat_start();
+    // Enable motion interrupts only after cart motion handling is ready.
+    // Allow fail on boards which do not have accelerometer.
+    (void) app_sensor_acc_thr_set (&motion_threshold);
 
     if (RD_SUCCESS == err_code)
     {
