@@ -1,4 +1,5 @@
 #include "app_config.h"
+#include "app_cart_motion.h"
 #include "app_sensor.h"
 #include "app_comms.h"
 #include "app_heartbeat.h"
@@ -205,6 +206,7 @@ on_accelerometer_isr (const ri_gpio_evt_t event)
     {
         LOG ("Movement \r\n");
         app_sensor_event_increment();
+        app_cart_motion_on_motion_isr();
     }
 }
 
