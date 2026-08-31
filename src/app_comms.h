@@ -165,6 +165,13 @@ rd_status_t app_comms_ble_uninit (void);
 rd_status_t app_comms_blocking_send (const ri_comm_xfer_fp_t reply_fp,
                                      ri_comm_message_t * const msg);
 
+/**
+ * @brief Set BLE advertising interval at runtime.
+ *
+ * @param[in] interval_ms Advertising interval in milliseconds.
+ */
+void app_comms_bleadv_interval_set (const uint16_t interval_ms);
+
 #ifdef CEEDLING
 /** Handles for unit test framework */
 typedef struct
