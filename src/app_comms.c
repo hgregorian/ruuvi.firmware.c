@@ -490,6 +490,11 @@ rd_status_t app_comms_configure_next_disable (void)
     return err_code;
 }
 
+void app_comms_bleadv_interval_set (const uint16_t interval_ms)
+{
+    ri_adv_tx_interval_set (interval_ms);
+}
+
 TESTABLE_STATIC void handle_config_disable (void * p_data, uint16_t data_len)
 {
     rd_status_t err_code = RD_SUCCESS;

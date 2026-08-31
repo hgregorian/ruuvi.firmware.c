@@ -34,6 +34,8 @@
 
 static ri_timer_id_t heart_timer; //!< Timer for updating data.
 
+static uint32_t heart_interval_ms = APP_HEARTBEAT_INTERVAL_MS;
+
 static uint64_t last_heartbeat_timestamp_ms; //!< Timestamp for heartbeat refresh.
 
 static app_dataformat_t m_dataformat_state; //!< State of heartbeat.
@@ -165,7 +167,7 @@ rd_status_t app_heartbeat_init (void)
 
         if (RD_SUCCESS == err_code)
         {
-            err_code |= ri_timer_start (heart_timer, APP_HEARTBEAT_INTERVAL_MS, NULL);
+            err_code |= ri_timer_start (heart_timer, heart_interval_ms, NULL);
         }
     }
 
@@ -183,7 +185,7 @@ rd_status_t app_heartbeat_start (void)
     else
     {
         heartbeat (NULL, 0);
-        err_code |= ri_timer_start (heart_timer, APP_HEARTBEAT_INTERVAL_MS, NULL);
+        err_code |= ri_timer_start (heart_timer, heart_interval_ms, NULL);
     }
 
     return err_code;
@@ -203,6 +205,29 @@ rd_status_t app_heartbeat_stop (void)
     }
 
     return err_code;
+}
+
+rd_status_t app_heartbeat_interval_set (const uint32_t interval_ms)
+{
+    rd_status_t err_code = RD_SUCCESS;
+
+    if (NULL == heart_timer)
+    {
+        err_code |= RD_ERROR_INVALID_STATE;
+    }
+    else
+    {
+        heart_interval_ms = interval_ms;
+        err_code |= ri_timer_stop (heart_timer);
+        err_code |= ri_timer_start (heart_timer, heart_interval_ms, NULL);
+    }
+
+    return err_code;
+}
+
+void app_heartbeat_now (void)
+{
+    heartbeat (NULL, 0U);
 }
 
 bool app_heartbeat_overdue (void)

@@ -59,6 +59,23 @@ rd_status_t app_heartbeat_start (void);
 rd_status_t app_heartbeat_stop (void);
 
 /**
+ * @brief Set heartbeat interval at runtime.
+ *
+ * Restarts the heartbeat timer using the new interval.
+ *
+ * @param[in] interval_ms Heartbeat interval in milliseconds.
+ *
+ * @retval RD_SUCCESS on success.
+ * @retval RD_ERROR_INVALID_STATE if heartbeat is not initialized.
+ */
+rd_status_t app_heartbeat_interval_set (const uint32_t interval_ms);
+
+/**
+ * @brief Immediately read sensors and transmit a fresh heartbeat.
+ */
+void app_heartbeat_now (void);
+
+/**
  * @brief Check if hearbeats have been paused for too long.
  *
  * @return True if current time is more than APP_HEARTBEAT_OVERDUE_INTERVAL_MS since last heartbeat.
