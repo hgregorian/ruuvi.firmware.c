@@ -20,6 +20,17 @@
 #define CART_IDLE_INTERVAL_MS       (120U * 1000U)
 #define CART_IDLE_TIMEOUT_MS        (5000U)
 
+#define CART_DUMP_CONFIRM_MS        (300U)
+#define CART_DUMP_LATCH_MS          (15U * 1000U)
+
+/*
+ * Consider the cart inverted when its acceleration vector is more than
+ * approximately 135 degrees from the upright reference vector.
+ *
+ * cos(135 degrees)^2 = 0.5. Checking the squared dot product avoids sqrtf().
+ */
+#define CART_DUMP_DOT_RATIO2        (0.50F)
+
 /*
  * Change in acceleration vector required to consider the cart still moving.
  *
@@ -33,11 +44,60 @@ static ri_timer_id_t m_idle_timer;
 static bool m_active;
 static bool m_have_previous_sample;
 
+static bool m_have_upright_sample;
+static bool m_dump_candidate;
+static bool m_dump_latched;
+static bool m_dump_armed;
+
 static float m_previous_x;
 static float m_previous_y;
 static float m_previous_z;
 
+static float m_upright_x;
+static float m_upright_y;
+static float m_upright_z;
+
 static uint64_t m_last_motion_ms;
+static uint64_t m_dump_candidate_since_ms;
+static uint64_t m_dump_latch_until_ms;
+
+static bool cart_is_inverted (const float x,
+                              const float y,
+                              const float z)
+{
+    if (!m_have_upright_sample)
+    {
+        return false;
+    }
+
+    const float dot =
+        (x * m_upright_x) +
+        (y * m_upright_y) +
+        (z * m_upright_z);
+
+    /*
+     * Inversion requires the vectors to point in opposite hemispheres.
+     */
+    if (dot >= 0.0F)
+    {
+        return false;
+    }
+
+    const float sample_mag2 =
+        (x * x) + (y * y) + (z * z);
+
+    const float upright_mag2 =
+        (m_upright_x * m_upright_x) +
+        (m_upright_y * m_upright_y) +
+        (m_upright_z * m_upright_z);
+
+    /*
+     * dot^2 / (|a|^2 |b|^2) >= 0.5 corresponds to an angle >= 135 degrees
+     * when dot is negative.
+     */
+    return (dot * dot) >=
+           (CART_DUMP_DOT_RATIO2 * sample_mag2 * upright_mag2);
+}
 
 static void cart_idle_timer_restart (void)
 {
@@ -60,6 +120,25 @@ static void cart_idle (void * p_event, uint16_t event_size)
      * a fresh motion sample reset the quiet period.
      */
     const uint64_t now_ms = ri_rtc_millis();
+
+    /*
+     * A detected dump keeps active telemetry running for the full latch
+     * interval even if physical motion has already stopped.
+     */
+    if (m_dump_latched)
+    {
+        if (now_ms < m_dump_latch_until_ms)
+        {
+            const uint32_t remaining_ms =
+                (uint32_t) (m_dump_latch_until_ms - now_ms);
+
+            (void) ri_timer_start (m_idle_timer, remaining_ms, NULL);
+            return;
+        }
+
+        m_dump_latched = false;
+    }
+
     const uint64_t quiet_ms = now_ms - m_last_motion_ms;
 
     if (quiet_ms < CART_IDLE_TIMEOUT_MS)
@@ -84,7 +163,7 @@ static void cart_idle (void * p_event, uint16_t event_size)
     /*
      * Return to low-power idle telemetry.
      *
-     * Generate a fresh sample every 60 seconds and retain the stock
+     * Generate a fresh sample at CART_IDLE_INTERVAL_MS and retain the stock
      * two-advertisement delivery behavior for each sample.
      */
     app_comms_bleadv_send_count_set (APP_NUM_REPEATS);
@@ -138,7 +217,15 @@ rd_status_t app_cart_motion_init (void)
     {
         m_active = false;
         m_have_previous_sample = false;
+        m_have_upright_sample = false;
+
+        m_dump_candidate = false;
+        m_dump_latched = false;
+        m_dump_armed = true;
+
         m_last_motion_ms = 0U;
+        m_dump_candidate_since_ms = 0U;
+        m_dump_latch_until_ms = 0U;
 
         err_code |= ri_timer_create (&m_idle_timer,
                                      RI_TIMER_MODE_SINGLE_SHOT,
@@ -184,6 +271,55 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
         return;
     }
 
+    const uint64_t now_ms = ri_rtc_millis();
+
+    /*
+     * The first valid active sample establishes the normal cart orientation.
+     * The cart is expected to enter active mode while still substantially
+     * upright when it is first picked up or begins moving.
+     */
+    if (!m_have_upright_sample)
+    {
+        m_upright_x = x;
+        m_upright_y = y;
+        m_upright_z = z;
+        m_have_upright_sample = true;
+    }
+
+    const bool inverted = cart_is_inverted (x, y, z);
+
+    if (inverted && m_dump_armed)
+    {
+        if (!m_dump_candidate)
+        {
+            m_dump_candidate = true;
+            m_dump_candidate_since_ms = now_ms;
+        }
+        else if ( (now_ms - m_dump_candidate_since_ms) >=
+                  CART_DUMP_CONFIRM_MS)
+        {
+            m_dump_candidate = false;
+            m_dump_latched = true;
+            m_dump_armed = false;
+            m_dump_latch_until_ms = now_ms + CART_DUMP_LATCH_MS;
+
+            /*
+             * Prevent the inactivity timeout from ending active telemetry
+             * before the dump latch expires.
+             */
+            cart_idle_timer_restart();
+        }
+    }
+    else if (!inverted)
+    {
+        m_dump_candidate = false;
+
+        if (!m_dump_latched)
+        {
+            m_dump_armed = true;
+        }
+    }
+
     if (m_have_previous_sample)
     {
         const float dx = x - m_previous_x;
@@ -194,7 +330,7 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
 
         if (delta_g2 >= CART_SAMPLE_MOTION_G2)
         {
-            m_last_motion_ms = ri_rtc_millis();
+            m_last_motion_ms = now_ms;
             cart_idle_timer_restart();
         }
     }
@@ -205,11 +341,18 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
          * starts a full quiet-period window.
          */
         m_have_previous_sample = true;
-        m_last_motion_ms = ri_rtc_millis();
+        m_last_motion_ms = now_ms;
         cart_idle_timer_restart();
     }
 
     m_previous_x = x;
     m_previous_y = y;
     m_previous_z = z;
+}
+
+uint8_t app_cart_motion_status_get (void)
+{
+    return m_dump_latched
+           ? APP_CART_STATUS_DUMP
+           : APP_CART_STATUS_NORMAL;
 }

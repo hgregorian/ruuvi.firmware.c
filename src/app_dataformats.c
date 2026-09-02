@@ -1,3 +1,4 @@
+#include "app_cart_motion.h"
 #include "app_dataformats.h"
 #include "app_sensor.h"
 #include "ruuvi_endpoints.h"
@@ -106,10 +107,20 @@ encode_to_5 (uint8_t * const output,
     ep_data.pressure_pa       = rd_sensor_data_parse (data, RD_SENSOR_PRES_FIELD);
     ep_data.temperature_c     = rd_sensor_data_parse (data, RD_SENSOR_TEMP_FIELD);
     ep_data.measurement_count = ep_5_measurement_count;
-    // uint8_t mvtctr = (uint8_t) (app_sensor_event_count_get() % (RE_5_MVTCTR_MAX + 1));
-    // ep_data.movement_count    = mvtctr;
+    /*
+     * DumpSense status/report byte encoded into RAWv2 movement_count:
+     *
+     *   bits 7..6: application status
+     *   bits 5..0: rolling report sequence
+     */
+    const uint8_t report_seq =
+        (uint8_t) (ep_5_measurement_count & 0x3FU);
+
+    const uint8_t status =
+        app_cart_motion_status_get();
+
     ep_data.movement_count =
-        (uint8_t) (ep_5_measurement_count % (RE_5_MVTCTR_MAX + 1));
+        (uint8_t) ((status << 6U) | report_seq);
     err_code |= ri_radio_address_get (&ep_data.address);
     err_code |= ri_adv_tx_power_get (&ep_data.tx_power);
     err_code |= rt_adc_vdd_get (&ep_data.battery_v);
