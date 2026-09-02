@@ -21,7 +21,7 @@
 #define CART_IDLE_TIMEOUT_MS        (5000U)
 
 #define CART_DUMP_CONFIRM_MS        (300U)
-#define CART_DUMP_LATCH_MS          (15U * 1000U)
+#define CART_DUMP_MIN_HOLD_MS       (15U * 1000U)
 
 /*
  * Consider the cart inverted when its acceleration vector is more than
@@ -30,6 +30,14 @@
  * cos(135 degrees)^2 = 0.5. Checking the squared dot product avoids sqrtf().
  */
 #define CART_DUMP_DOT_RATIO2        (0.50F)
+
+/*
+ * Consider the cart returned upright when its acceleration vector is less
+ * than approximately 60 degrees from the upright reference vector.
+ *
+ * cos(60 degrees)^2 = 0.25.
+ */
+#define CART_UPRIGHT_DOT_RATIO2     (0.25F)
 
 /*
  * Change in acceleration vector required to consider the cart still moving.
@@ -59,7 +67,7 @@ static float m_upright_z;
 
 static uint64_t m_last_motion_ms;
 static uint64_t m_dump_candidate_since_ms;
-static uint64_t m_dump_latch_until_ms;
+static uint64_t m_dump_min_hold_until_ms;
 
 static bool cart_is_inverted (const float x,
                               const float y,
@@ -99,6 +107,44 @@ static bool cart_is_inverted (const float x,
            (CART_DUMP_DOT_RATIO2 * sample_mag2 * upright_mag2);
 }
 
+static bool cart_is_upright (const float x,
+                             const float y,
+                             const float z)
+{
+    if (!m_have_upright_sample)
+    {
+        return false;
+    }
+
+    const float dot =
+        (x * m_upright_x) +
+        (y * m_upright_y) +
+        (z * m_upright_z);
+
+    /*
+     * Upright requires both vectors to point into the same hemisphere.
+     */
+    if (dot <= 0.0F)
+    {
+        return false;
+    }
+
+    const float sample_mag2 =
+        (x * x) + (y * y) + (z * z);
+
+    const float upright_mag2 =
+        (m_upright_x * m_upright_x) +
+        (m_upright_y * m_upright_y) +
+        (m_upright_z * m_upright_z);
+
+    /*
+     * dot^2 / (|a|^2 |b|^2) >= 0.25 corresponds to an angle <= 60 degrees
+     * when dot is positive.
+     */
+    return (dot * dot) >=
+           (CART_UPRIGHT_DOT_RATIO2 * sample_mag2 * upright_mag2);
+}
+
 static void cart_idle_timer_restart (void)
 {
     (void) ri_timer_stop (m_idle_timer);
@@ -122,21 +168,14 @@ static void cart_idle (void * p_event, uint16_t event_size)
     const uint64_t now_ms = ri_rtc_millis();
 
     /*
-     * A detected dump keeps active telemetry running for the full latch
-     * interval even if physical motion has already stopped.
+     * While dump state is asserted, remain in active telemetry mode.
+     * app_cart_motion_on_sample() clears the state only after the minimum
+     * hold interval has elapsed and the cart has returned upright.
      */
     if (m_dump_latched)
     {
-        if (now_ms < m_dump_latch_until_ms)
-        {
-            const uint32_t remaining_ms =
-                (uint32_t) (m_dump_latch_until_ms - now_ms);
-
-            (void) ri_timer_start (m_idle_timer, remaining_ms, NULL);
-            return;
-        }
-
-        m_dump_latched = false;
+        cart_idle_timer_restart();
+        return;
     }
 
     const uint64_t quiet_ms = now_ms - m_last_motion_ms;
@@ -225,7 +264,7 @@ rd_status_t app_cart_motion_init (void)
 
         m_last_motion_ms = 0U;
         m_dump_candidate_since_ms = 0U;
-        m_dump_latch_until_ms = 0U;
+        m_dump_min_hold_until_ms = 0U;
 
         err_code |= ri_timer_create (&m_idle_timer,
                                      RI_TIMER_MODE_SINGLE_SHOT,
@@ -288,7 +327,22 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
 
     const bool inverted = cart_is_inverted (x, y, z);
 
-    if (inverted && m_dump_armed)
+    const bool upright = cart_is_upright (x, y, z);
+
+    if (m_dump_latched)
+    {
+        /*
+         * The dump status is asserted for at least CART_DUMP_MIN_HOLD_MS.
+         * After that minimum interval, clear it only after the cart has
+         * physically returned close to its normal upright orientation.
+         */
+        if ( (now_ms >= m_dump_min_hold_until_ms) && upright)
+        {
+            m_dump_latched = false;
+            m_dump_armed = true;
+        }
+    }
+    else if (inverted && m_dump_armed)
     {
         if (!m_dump_candidate)
         {
@@ -301,11 +355,10 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
             m_dump_candidate = false;
             m_dump_latched = true;
             m_dump_armed = false;
-            m_dump_latch_until_ms = now_ms + CART_DUMP_LATCH_MS;
+            m_dump_min_hold_until_ms = now_ms + CART_DUMP_MIN_HOLD_MS;
 
             /*
-             * Prevent the inactivity timeout from ending active telemetry
-             * before the dump latch expires.
+             * Keep active telemetry running while dump status is asserted.
              */
             cart_idle_timer_restart();
         }
@@ -313,11 +366,6 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
     else if (!inverted)
     {
         m_dump_candidate = false;
-
-        if (!m_dump_latched)
-        {
-            m_dump_armed = true;
-        }
     }
 
     if (m_have_previous_sample)
