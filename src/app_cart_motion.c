@@ -17,6 +17,7 @@
 #include <stdbool.h>
 
 #define CART_ACTIVE_INTERVAL_MS     (100U)
+#define CART_IDLE_INTERVAL_MS       (60U * 1000U)
 #define CART_IDLE_TIMEOUT_MS        (5000U)
 
 /*
@@ -81,11 +82,14 @@ static void cart_idle (void * p_event, uint16_t event_size)
      */
     app_heartbeat_now();
     /*
-     * Restore stock Ruuvi telemetry behavior.
+     * Return to low-power idle telemetry.
+     *
+     * Generate a fresh sample every 60 seconds and retain the stock
+     * two-advertisement delivery behavior for each sample.
      */
     app_comms_bleadv_send_count_set (APP_NUM_REPEATS);
     app_comms_bleadv_interval_set (APP_BLE_INTERVAL_MS);
-    (void) app_heartbeat_interval_set (APP_HEARTBEAT_INTERVAL_MS);
+    (void) app_heartbeat_interval_set (CART_IDLE_INTERVAL_MS);
 }
 
 static void cart_idle_timeout_isr (void * const p_context)
@@ -139,6 +143,13 @@ rd_status_t app_cart_motion_init (void)
         err_code |= ri_timer_create (&m_idle_timer,
                                      RI_TIMER_MODE_SINGLE_SHOT,
                                      &cart_idle_timeout_isr);
+
+        /*
+         * DumpSense spends most of its life stationary. Keep periodic
+         * idle telemetry infrequent while relying on the accelerometer
+         * interrupt for immediate transition to active telemetry.
+         */
+        err_code |= app_heartbeat_interval_set (CART_IDLE_INTERVAL_MS);
     }
 
     return err_code;
