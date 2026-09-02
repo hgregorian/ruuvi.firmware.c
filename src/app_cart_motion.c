@@ -16,7 +16,8 @@
 #include <math.h>
 #include <stdbool.h>
 
-#define CART_ACTIVE_INTERVAL_MS     (100U)
+#define CART_MOTION_INTERVAL_MS     (200U)
+#define CART_DUMP_INTERVAL_MS       (100U)
 #define CART_IDLE_INTERVAL_MS       (120U * 1000U)
 #define CART_IDLE_TIMEOUT_MS        (5000U)
 
@@ -56,6 +57,7 @@ static bool m_have_upright_sample;
 static bool m_dump_candidate;
 static bool m_dump_latched;
 static bool m_dump_armed;
+static bool m_dump_fast;
 
 static float m_previous_x;
 static float m_previous_y;
@@ -168,7 +170,7 @@ static void cart_idle (void * p_event, uint16_t event_size)
     const uint64_t now_ms = ri_rtc_millis();
 
     /*
-     * While dump state is asserted, remain in active telemetry mode.
+     * While dump state is asserted, remain out of idle telemetry mode.
      * app_cart_motion_on_sample() clears the state only after the minimum
      * hold interval has elapsed and the cart has returned upright.
      */
@@ -230,15 +232,15 @@ static void cart_motion (void * p_event, uint16_t event_size)
          * Enter active telemetry mode.
          */
         app_comms_bleadv_send_count_set (1U);
-        app_comms_bleadv_interval_set (CART_ACTIVE_INTERVAL_MS);
-        (void) app_heartbeat_interval_set (CART_ACTIVE_INTERVAL_MS);
+        app_comms_bleadv_interval_set (CART_MOTION_INTERVAL_MS);
+        (void) app_heartbeat_interval_set (CART_MOTION_INTERVAL_MS);
 
         m_active = true;
         m_have_previous_sample = false;
 
         /*
          * Generate fresh telemetry immediately rather than waiting for the
-         * first 100 ms heartbeat timer expiration.
+         * first CART_MOTION_INTERVAL_MS heartbeat timer expiration.
          */
         app_heartbeat_now();
     }
@@ -261,6 +263,7 @@ rd_status_t app_cart_motion_init (void)
         m_dump_candidate = false;
         m_dump_latched = false;
         m_dump_armed = true;
+        m_dump_fast = false;
 
         m_last_motion_ms = 0U;
         m_dump_candidate_since_ms = 0U;
@@ -299,7 +302,10 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
      * interval while cart active mode is already running.
      */
     app_comms_bleadv_send_count_set (1U);
-    app_comms_bleadv_interval_set (CART_ACTIVE_INTERVAL_MS);
+    app_comms_bleadv_interval_set (
+        m_dump_fast
+            ? CART_DUMP_INTERVAL_MS
+            : CART_MOTION_INTERVAL_MS);
 
     const float x = rd_sensor_data_parse (p_data, RD_SENSOR_ACC_X_FIELD);
     const float y = rd_sensor_data_parse (p_data, RD_SENSOR_ACC_Y_FIELD);
@@ -329,6 +335,19 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
 
     const bool upright = cart_is_upright (x, y, z);
 
+    /*
+     * Use CART_DUMP_INTERVAL_MS telemetry only to protect delivery of the dump
+     * event. After the minimum hold interval, return to CART_MOTION_INTERVAL_MS
+     * even if the dump status remains asserted.
+     */
+    if (m_dump_fast && (now_ms >= m_dump_min_hold_until_ms))
+    {
+        m_dump_fast = false;
+
+        app_comms_bleadv_interval_set (CART_MOTION_INTERVAL_MS);
+        (void) app_heartbeat_interval_set (CART_MOTION_INTERVAL_MS);
+    }
+
     if (m_dump_latched)
     {
         /*
@@ -355,10 +374,15 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
             m_dump_candidate = false;
             m_dump_latched = true;
             m_dump_armed = false;
+            m_dump_fast = true;
             m_dump_min_hold_until_ms = now_ms + CART_DUMP_MIN_HOLD_MS;
 
+            app_comms_bleadv_send_count_set (1U);
+            app_comms_bleadv_interval_set (CART_DUMP_INTERVAL_MS);
+            (void) app_heartbeat_interval_set (CART_DUMP_INTERVAL_MS);
+
             /*
-             * Keep active telemetry running while dump status is asserted.
+             * Keep non-idle telemetry running while dump status is asserted.
              */
             cart_idle_timer_restart();
         }
