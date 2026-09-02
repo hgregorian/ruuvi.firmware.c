@@ -16,6 +16,10 @@
 #include <math.h>
 #include <stdbool.h>
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846F
+#endif
+
 #define CART_MOTION_INTERVAL_MS     (200U)
 #define CART_DUMP_INTERVAL_MS       (100U)
 #define CART_IDLE_INTERVAL_MS       (120U * 1000U)
@@ -100,33 +104,17 @@ static float cart_angle_from_upright_deg (const float x,
         cosine = -1.0F;
     }
 
-    return acosf (cosine) * (180.0F / (float) M_PI);
+    return acosf (cosine) * (180.0F / M_PI);
 }
 
-static bool cart_is_inverted (const float x,
-                              const float y,
-                              const float z)
+static bool cart_is_inverted (const float angle_deg)
 {
-    if (!m_have_upright_sample)
-    {
-        return false;
-    }
-
-    return cart_angle_from_upright_deg (x, y, z) >=
-           CART_DUMP_ANGLE_DEG;
+    return angle_deg >= CART_DUMP_ANGLE_DEG;
 }
 
-static bool cart_is_upright (const float x,
-                             const float y,
-                             const float z)
+static bool cart_is_upright (const float angle_deg)
 {
-    if (!m_have_upright_sample)
-    {
-        return false;
-    }
-
-    return cart_angle_from_upright_deg (x, y, z) <=
-           CART_UPRIGHT_ANGLE_DEG;
+    return angle_deg <= CART_UPRIGHT_ANGLE_DEG;
 }
 
 static void cart_idle_timer_restart (void)
@@ -317,10 +305,10 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
         cart_angle_from_upright_deg (x, y, z);
 
     const bool inverted =
-        angle_deg >= CART_DUMP_ANGLE_DEG;
+        cart_is_inverted (angle_deg);
 
     const bool upright =
-        angle_deg <= CART_UPRIGHT_ANGLE_DEG;
+        cart_is_upright (angle_deg);
 
     /*
      * Use CART_DUMP_INTERVAL_MS telemetry only to protect delivery of the dump
