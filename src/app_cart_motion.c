@@ -17,7 +17,7 @@
 #include <stdbool.h>
 
 #define CART_ACTIVE_INTERVAL_MS     (100U)
-#define CART_IDLE_INTERVAL_MS       (60U * 1000U)
+#define CART_IDLE_INTERVAL_MS       (120U * 1000U)
 #define CART_IDLE_TIMEOUT_MS        (5000U)
 
 /*
