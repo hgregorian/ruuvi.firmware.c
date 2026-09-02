@@ -25,20 +25,16 @@
 #define CART_DUMP_MIN_HOLD_MS       (15U * 1000U)
 
 /*
- * Consider the cart inverted when its acceleration vector is more than
- * approximately 135 degrees from the upright reference vector.
- *
- * cos(135 degrees)^2 = 0.5. Checking the squared dot product avoids sqrtf().
+ * Consider the cart inverted when its acceleration vector is at least
+ * CART_DUMP_ANGLE_DEG from the upright reference vector.
  */
-#define CART_DUMP_DOT_RATIO2        (0.50F)
+#define CART_DUMP_ANGLE_DEG         (135.0F)
 
 /*
- * Consider the cart returned upright when its acceleration vector is less
- * than approximately 60 degrees from the upright reference vector.
- *
- * cos(60 degrees)^2 = 0.25.
+ * Consider the cart returned upright when its acceleration vector is at most
+ * CART_UPRIGHT_ANGLE_DEG from the upright reference vector.
  */
-#define CART_UPRIGHT_DOT_RATIO2     (0.25F)
+#define CART_UPRIGHT_ANGLE_DEG      (60.0F)
 
 /*
  * Change in acceleration vector required to consider the cart still moving.
@@ -71,6 +67,42 @@ static uint64_t m_last_motion_ms;
 static uint64_t m_dump_candidate_since_ms;
 static uint64_t m_dump_min_hold_until_ms;
 
+static float cart_angle_from_upright_deg (const float x,
+                                          const float y,
+                                          const float z)
+{
+    const float dot =
+        (x * m_upright_x) +
+        (y * m_upright_y) +
+        (z * m_upright_z);
+
+    const float sample_mag =
+        sqrtf ((x * x) + (y * y) + (z * z));
+
+    const float upright_mag =
+        sqrtf ((m_upright_x * m_upright_x) +
+               (m_upright_y * m_upright_y) +
+               (m_upright_z * m_upright_z));
+
+    if ((sample_mag <= 0.0F) || (upright_mag <= 0.0F))
+    {
+        return NAN;
+    }
+
+    float cosine = dot / (sample_mag * upright_mag);
+
+    if (cosine > 1.0F)
+    {
+        cosine = 1.0F;
+    }
+    else if (cosine < -1.0F)
+    {
+        cosine = -1.0F;
+    }
+
+    return acosf (cosine) * (180.0F / (float) M_PI);
+}
+
 static bool cart_is_inverted (const float x,
                               const float y,
                               const float z)
@@ -80,33 +112,8 @@ static bool cart_is_inverted (const float x,
         return false;
     }
 
-    const float dot =
-        (x * m_upright_x) +
-        (y * m_upright_y) +
-        (z * m_upright_z);
-
-    /*
-     * Inversion requires the vectors to point in opposite hemispheres.
-     */
-    if (dot >= 0.0F)
-    {
-        return false;
-    }
-
-    const float sample_mag2 =
-        (x * x) + (y * y) + (z * z);
-
-    const float upright_mag2 =
-        (m_upright_x * m_upright_x) +
-        (m_upright_y * m_upright_y) +
-        (m_upright_z * m_upright_z);
-
-    /*
-     * dot^2 / (|a|^2 |b|^2) >= 0.5 corresponds to an angle >= 135 degrees
-     * when dot is negative.
-     */
-    return (dot * dot) >=
-           (CART_DUMP_DOT_RATIO2 * sample_mag2 * upright_mag2);
+    return cart_angle_from_upright_deg (x, y, z) >=
+           CART_DUMP_ANGLE_DEG;
 }
 
 static bool cart_is_upright (const float x,
@@ -118,33 +125,8 @@ static bool cart_is_upright (const float x,
         return false;
     }
 
-    const float dot =
-        (x * m_upright_x) +
-        (y * m_upright_y) +
-        (z * m_upright_z);
-
-    /*
-     * Upright requires both vectors to point into the same hemisphere.
-     */
-    if (dot <= 0.0F)
-    {
-        return false;
-    }
-
-    const float sample_mag2 =
-        (x * x) + (y * y) + (z * z);
-
-    const float upright_mag2 =
-        (m_upright_x * m_upright_x) +
-        (m_upright_y * m_upright_y) +
-        (m_upright_z * m_upright_z);
-
-    /*
-     * dot^2 / (|a|^2 |b|^2) >= 0.25 corresponds to an angle <= 60 degrees
-     * when dot is positive.
-     */
-    return (dot * dot) >=
-           (CART_UPRIGHT_DOT_RATIO2 * sample_mag2 * upright_mag2);
+    return cart_angle_from_upright_deg (x, y, z) <=
+           CART_UPRIGHT_ANGLE_DEG;
 }
 
 static void cart_idle_timer_restart (void)
@@ -331,9 +313,14 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
         m_have_upright_sample = true;
     }
 
-    const bool inverted = cart_is_inverted (x, y, z);
+    const float angle_deg =
+        cart_angle_from_upright_deg (x, y, z);
 
-    const bool upright = cart_is_upright (x, y, z);
+    const bool inverted =
+        angle_deg >= CART_DUMP_ANGLE_DEG;
+
+    const bool upright =
+        angle_deg <= CART_UPRIGHT_ANGLE_DEG;
 
     /*
      * Use CART_DUMP_INTERVAL_MS telemetry only to protect delivery of the dump
