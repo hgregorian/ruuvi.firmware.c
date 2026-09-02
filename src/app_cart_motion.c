@@ -49,6 +49,17 @@
 #define CART_SAMPLE_MOTION_G        (0.050F)
 #define CART_SAMPLE_MOTION_G2       (CART_SAMPLE_MOTION_G * CART_SAMPLE_MOTION_G)
 
+#define CART_MOVING_CONFIRM_MS       (3U * 1000U)
+#define CART_MOVING_GAP_TOLERANCE_MS (1000U)
+
+/*
+ * Consider the cart in its normal rolling posture when its acceleration
+ * vector is between CART_MOVING_MIN_ANGLE_DEG and
+ * CART_MOVING_MAX_ANGLE_DEG from the upright reference vector.
+ */
+#define CART_MOVING_MIN_ANGLE_DEG    (10.0F)
+#define CART_MOVING_MAX_ANGLE_DEG    (60.0F)
+
 static ri_timer_id_t m_idle_timer;
 static bool m_active;
 static bool m_have_previous_sample;
@@ -70,6 +81,11 @@ static float m_upright_z;
 static uint64_t m_last_motion_ms;
 static uint64_t m_dump_candidate_since_ms;
 static uint64_t m_dump_min_hold_until_ms;
+
+static bool m_moving_candidate;
+static bool m_moving;
+static uint64_t m_moving_candidate_since_ms;
+static uint64_t m_last_rolling_motion_ms;
 
 static float cart_angle_from_upright_deg (const float x,
                                           const float y,
@@ -115,6 +131,12 @@ static bool cart_is_inverted (const float angle_deg)
 static bool cart_is_upright (const float angle_deg)
 {
     return angle_deg <= CART_UPRIGHT_ANGLE_DEG;
+}
+
+static bool cart_is_rolling (const float angle_deg)
+{
+    return (angle_deg >= CART_MOVING_MIN_ANGLE_DEG) &&
+           (angle_deg <= CART_MOVING_MAX_ANGLE_DEG);
 }
 
 static void cart_idle_timer_restart (void)
@@ -167,6 +189,9 @@ static void cart_idle (void * p_event, uint16_t event_size)
      */
     m_active = false;
     m_have_previous_sample = false;
+
+    m_moving_candidate = false;
+    m_moving = false;
     /*
      * Send one final fresh sample while fast advertising is still active.
      */
@@ -239,6 +264,12 @@ rd_status_t app_cart_motion_init (void)
         m_dump_candidate_since_ms = 0U;
         m_dump_min_hold_until_ms = 0U;
 
+        m_moving_candidate = false;
+        m_moving = false;
+
+        m_moving_candidate_since_ms = 0U;
+        m_last_rolling_motion_ms = 0U;
+
         err_code |= ri_timer_create (&m_idle_timer,
                                      RI_TIMER_MODE_SINGLE_SHOT,
                                      &cart_idle_timeout_isr);
@@ -310,6 +341,9 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
     const bool upright =
         cart_is_upright (angle_deg);
 
+    const bool rolling =
+        cart_is_rolling (angle_deg);
+
     /*
      * Use CART_DUMP_INTERVAL_MS telemetry only to protect delivery of the dump
      * event. After the minimum hold interval, return to CART_MOTION_INTERVAL_MS
@@ -375,10 +409,52 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
 
         const float delta_g2 = (dx * dx) + (dy * dy) + (dz * dz);
 
-        if (delta_g2 >= CART_SAMPLE_MOTION_G2)
+        const bool sample_moving =
+            delta_g2 >= CART_SAMPLE_MOTION_G2;
+
+        const bool rolling_motion =
+            sample_moving && rolling;
+
+        if (sample_moving)
         {
             m_last_motion_ms = now_ms;
             cart_idle_timer_restart();
+        }
+
+        if (rolling_motion)
+        {
+            /*
+             * A gap longer than CART_MOVING_GAP_TOLERANCE_MS starts a new
+             * sustained rolling-motion candidate.
+             */
+            if (m_moving_candidate &&
+                ((now_ms - m_last_rolling_motion_ms) >
+                 CART_MOVING_GAP_TOLERANCE_MS))
+            {
+                m_moving_candidate = false;
+            }
+
+            if ((!m_moving) && (!m_moving_candidate))
+            {
+                m_moving_candidate = true;
+                m_moving_candidate_since_ms = now_ms;
+            }
+            else if (m_moving_candidate &&
+                     ((now_ms - m_moving_candidate_since_ms) >=
+                      CART_MOVING_CONFIRM_MS))
+            {
+                m_moving_candidate = false;
+                m_moving = true;
+            }
+
+            m_last_rolling_motion_ms = now_ms;
+        }
+        else if ((m_moving_candidate || m_moving) &&
+                 ((now_ms - m_last_rolling_motion_ms) >
+                  CART_MOVING_GAP_TOLERANCE_MS))
+        {
+            m_moving_candidate = false;
+            m_moving = false;
         }
     }
     else
@@ -399,7 +475,15 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
 
 uint8_t app_cart_motion_status_get (void)
 {
-    return m_dump_latched
-           ? APP_CART_STATUS_DUMP
-           : APP_CART_STATUS_NORMAL;
+    if (m_dump_latched)
+    {
+        return APP_CART_STATUS_DUMP;
+    }
+
+    if (m_moving)
+    {
+        return APP_CART_STATUS_MOVING;
+    }
+
+    return APP_CART_STATUS_NORMAL;
 }

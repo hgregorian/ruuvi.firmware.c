@@ -18,6 +18,7 @@
  */
 #define APP_CART_STATUS_NORMAL      (0U)
 #define APP_CART_STATUS_DUMP        (1U)
+#define APP_CART_STATUS_MOVING      (2U)
 
 /**
  * @brief Initialize cart motion handling.
@@ -42,7 +43,7 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data);
 /**
  * @brief Get the current DumpSense application status.
  *
- * @return APP_CART_STATUS_NORMAL or APP_CART_STATUS_DUMP.
+ * @return One of the APP_CART_STATUS_* values.
  */
 uint8_t app_cart_motion_status_get (void);
 
