@@ -85,6 +85,7 @@ static bool m_active;
 static bool m_have_previous_sample;
 
 static bool m_have_upright_sample;
+static bool m_have_gesture_reference;
 static bool m_dump_candidate;
 static bool m_dump_latched;
 static bool m_dump_armed;
@@ -97,6 +98,10 @@ static float m_previous_z;
 static float m_upright_x;
 static float m_upright_y;
 static float m_upright_z;
+
+static float m_gesture_ref_x;
+static float m_gesture_ref_y;
+static float m_gesture_ref_z;
 
 static uint64_t m_last_motion_ms;
 static uint64_t m_dump_candidate_since_ms;
@@ -236,29 +241,32 @@ static void cart_gesture_update (const float angle_deg,
     }
 }
 
-static float cart_angle_from_upright_deg (const float x,
-                                          const float y,
-                                          const float z)
+static float cart_angle_from_reference_deg (const float x,
+                                            const float y,
+                                            const float z,
+                                            const float ref_x,
+                                            const float ref_y,
+                                            const float ref_z)
 {
     const float dot =
-        (x * m_upright_x) +
-        (y * m_upright_y) +
-        (z * m_upright_z);
+        (x * ref_x) +
+        (y * ref_y) +
+        (z * ref_z);
 
     const float sample_mag =
         sqrtf ((x * x) + (y * y) + (z * z));
 
-    const float upright_mag =
-        sqrtf ((m_upright_x * m_upright_x) +
-               (m_upright_y * m_upright_y) +
-               (m_upright_z * m_upright_z));
+    const float reference_mag =
+        sqrtf ((ref_x * ref_x) +
+               (ref_y * ref_y) +
+               (ref_z * ref_z));
 
-    if ((sample_mag <= 0.0F) || (upright_mag <= 0.0F))
+    if ((sample_mag <= 0.0F) || (reference_mag <= 0.0F))
     {
         return NAN;
     }
 
-    float cosine = dot / (sample_mag * upright_mag);
+    float cosine = dot / (sample_mag * reference_mag);
 
     if (cosine > 1.0F)
     {
@@ -393,6 +401,7 @@ static void cart_motion (void * p_event, uint16_t event_size)
 
         m_active = true;
         m_have_previous_sample = false;
+        m_have_gesture_reference = false;
 
         /*
          * Generate fresh telemetry immediately rather than waiting for the
@@ -415,6 +424,7 @@ rd_status_t app_cart_motion_init (void)
         m_active = false;
         m_have_previous_sample = false;
         m_have_upright_sample = false;
+        m_have_gesture_reference = false;
 
         m_dump_candidate = false;
         m_dump_latched = false;
@@ -499,8 +509,31 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
         m_have_upright_sample = true;
     }
 
+    if (!m_have_gesture_reference)
+    {
+        m_gesture_ref_x = x;
+        m_gesture_ref_y = y;
+        m_gesture_ref_z = z;
+        m_have_gesture_reference = true;
+    }
+
     const float angle_deg =
-        cart_angle_from_upright_deg (x, y, z);
+        cart_angle_from_reference_deg (
+            x,
+            y,
+            z,
+            m_upright_x,
+            m_upright_y,
+            m_upright_z);
+
+    const float gesture_angle_deg =
+        cart_angle_from_reference_deg (
+            x,
+            y,
+            z,
+            m_gesture_ref_x,
+            m_gesture_ref_y,
+            m_gesture_ref_z);
 
     const bool inverted =
         cart_is_inverted (angle_deg);
@@ -624,7 +657,7 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
             m_moving = false;
         }
 
-        cart_gesture_update (angle_deg, now_ms);
+        cart_gesture_update (gesture_angle_deg, now_ms);
     }
     else
     {
