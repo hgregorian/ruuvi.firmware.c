@@ -513,7 +513,40 @@ void app_cart_motion_on_motion_isr (void)
 
 void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
 {
-    if ( (!m_active) || (NULL == p_data))
+    if (NULL == p_data)
+    {
+        return;
+    }
+
+    const float x = rd_sensor_data_parse (p_data, RD_SENSOR_ACC_X_FIELD);
+    const float y = rd_sensor_data_parse (p_data, RD_SENSOR_ACC_Y_FIELD);
+    const float z = rd_sensor_data_parse (p_data, RD_SENSOR_ACC_Z_FIELD);
+
+    if (isnan (x) || isnan (y) || isnan (z))
+    {
+        return;
+    }
+
+    /*
+     * The first valid accelerometer sample after startup establishes the
+     * permanent cart upright reference, even while motion processing is idle.
+     * This lets the stationary startup heartbeat following commissioning
+     * re-home the cart before its next movement.
+     */
+    if (!m_have_upright_sample)
+    {
+        m_upright_x = x;
+        m_upright_y = y;
+        m_upright_z = z;
+        m_have_upright_sample = true;
+    }
+
+    /*
+     * Idle/startup samples may establish the permanent upright reference, but
+     * all DUMP, MOVING, gesture, and active-telemetry processing remains gated
+     * by m_active.
+     */
+    if (!m_active)
     {
         return;
     }
@@ -529,29 +562,7 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
             ? CART_DUMP_INTERVAL_MS
             : CART_MOTION_INTERVAL_MS);
 
-    const float x = rd_sensor_data_parse (p_data, RD_SENSOR_ACC_X_FIELD);
-    const float y = rd_sensor_data_parse (p_data, RD_SENSOR_ACC_Y_FIELD);
-    const float z = rd_sensor_data_parse (p_data, RD_SENSOR_ACC_Z_FIELD);
-
-    if (isnan (x) || isnan (y) || isnan (z))
-    {
-        return;
-    }
-
     const uint64_t now_ms = ri_rtc_millis();
-
-    /*
-     * The first valid active sample establishes the normal cart orientation.
-     * The cart is expected to enter active mode while still substantially
-     * upright when it is first picked up or begins moving.
-     */
-    if (!m_have_upright_sample)
-    {
-        m_upright_x = x;
-        m_upright_y = y;
-        m_upright_z = z;
-        m_have_upright_sample = true;
-    }
 
     const float angle_deg =
         cart_angle_from_reference_deg (
