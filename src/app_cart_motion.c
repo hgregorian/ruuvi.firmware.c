@@ -37,7 +37,6 @@
 #define CART_GESTURE_UPRIGHT_ANGLE_DEG   (15.0F)
 #define CART_GESTURE_STEP_TIMEOUT_MS     (5U * 1000U)
 #define CART_GESTURE_TIP_COUNT           (3U)
-#define CART_GESTURE_REFERENCE_SETTLE_MS (1000U)
 
 #define CART_GESTURE_DIAG_NONE            (0U)
 #define CART_GESTURE_DIAG_TIP_1           (1U)
@@ -126,7 +125,6 @@ static cart_gesture_state_t m_gesture_state;
 static uint8_t m_gesture_tip_count;
 static bool m_gesture_waiting_for_upright;
 static uint64_t m_gesture_step_since_ms;
-static uint64_t m_gesture_reference_stable_since_ms;
 
 static void cart_gesture_led_on (void)
 {
@@ -377,6 +375,20 @@ static void cart_idle (void * p_event, uint16_t event_size)
     }
 
     /*
+     * The cart has now been quiet for CART_IDLE_TIMEOUT_MS. Preserve its
+     * settled orientation as the reference for the next commissioning gesture
+     * attempt. This lets the first movement after idle be tip #1 rather than
+     * requiring a separate wake-and-settle step.
+     */
+    if (m_have_previous_sample)
+    {
+        m_gesture_ref_x = m_previous_x;
+        m_gesture_ref_y = m_previous_y;
+        m_gesture_ref_z = m_previous_z;
+        m_have_gesture_reference = true;
+    }
+
+    /*
      * Stop motion evaluation before taking the final sample so the final
      * heartbeat cannot restart the inactivity timer.
      */
@@ -425,8 +437,6 @@ static void cart_motion (void * p_event, uint16_t event_size)
 
         m_active = true;
         m_have_previous_sample = false;
-        m_have_gesture_reference = false;
-        m_gesture_reference_stable_since_ms = 0U;
 
         cart_gesture_reset (CART_GESTURE_DIAG_NONE);
 
@@ -472,7 +482,6 @@ rd_status_t app_cart_motion_init (void)
         m_gesture_tip_count = 0U;
         m_gesture_waiting_for_upright = false;
         m_gesture_step_since_ms = 0U;
-        m_gesture_reference_stable_since_ms = 0U;
         m_gesture_diag = CART_GESTURE_DIAG_NONE;
 
         err_code |= ri_timer_create (&m_idle_timer,
@@ -622,32 +631,6 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
 
         const bool sample_moving =
             delta_g2 >= CART_SAMPLE_MOTION_G2;
-
-        /*
-         * Establish the commissioning gesture reference only after the cart has
-         * remained stationary for CART_GESTURE_REFERENCE_SETTLE_MS. This avoids
-         * capturing a partially tipped orientation from the motion which woke the
-         * device.
-         */
-        if (!m_have_gesture_reference)
-        {
-            if (sample_moving)
-            {
-                m_gesture_reference_stable_since_ms = now_ms;
-            }
-            else if (0U == m_gesture_reference_stable_since_ms)
-            {
-                m_gesture_reference_stable_since_ms = now_ms;
-            }
-            else if ((now_ms - m_gesture_reference_stable_since_ms) >=
-                     CART_GESTURE_REFERENCE_SETTLE_MS)
-            {
-                m_gesture_ref_x = x;
-                m_gesture_ref_y = y;
-                m_gesture_ref_z = z;
-                m_have_gesture_reference = true;
-            }
-        }
 
         const bool rolling_motion =
             sample_moving && rolling;
