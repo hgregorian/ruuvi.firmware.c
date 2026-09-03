@@ -70,7 +70,7 @@
 #define CART_SAMPLE_MOTION_G2       (CART_SAMPLE_MOTION_G * CART_SAMPLE_MOTION_G)
 
 #define CART_MOVING_CONFIRM_MS       (3U * 1000U)
-#define CART_MOVING_GAP_TOLERANCE_MS (1000U)
+#define CART_MOVING_GAP_TOLERANCE_MS (2000U)
 
 /*
  * Consider the cart in its normal rolling posture when its acceleration
@@ -78,7 +78,7 @@
  * CART_MOVING_MAX_ANGLE_DEG from the upright reference vector.
  */
 #define CART_MOVING_MIN_ANGLE_DEG    (10.0F)
-#define CART_MOVING_MAX_ANGLE_DEG    (60.0F)
+#define CART_MOVING_MAX_ANGLE_DEG    (75.0F)
 
 static ri_timer_id_t m_idle_timer;
 static bool m_active;
