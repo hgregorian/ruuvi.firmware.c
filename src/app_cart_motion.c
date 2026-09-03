@@ -28,6 +28,11 @@
 #define CART_DUMP_CONFIRM_MS        (300U)
 #define CART_DUMP_MIN_HOLD_MS       (15U * 1000U)
 
+#define CART_GESTURE_TIP_ANGLE_DEG       (65.0F)
+#define CART_GESTURE_UPRIGHT_ANGLE_DEG   (10.0F)
+#define CART_GESTURE_STEP_TIMEOUT_MS     (5U * 1000U)
+#define CART_GESTURE_TIP_COUNT           (3U)
+
 /*
  * Consider the cart inverted when its acceleration vector is at least
  * CART_DUMP_ANGLE_DEG from the upright reference vector.
@@ -86,6 +91,117 @@ static bool m_moving_candidate;
 static bool m_moving;
 static uint64_t m_moving_candidate_since_ms;
 static uint64_t m_last_rolling_motion_ms;
+
+typedef enum
+{
+    CART_GESTURE_IDLE = 0,
+    CART_GESTURE_IN_PROGRESS,
+    CART_GESTURE_WAIT_IDLE
+} cart_gesture_state_t;
+
+static cart_gesture_state_t m_gesture_state;
+static uint8_t m_gesture_tip_count;
+static bool m_gesture_waiting_for_upright;
+static uint64_t m_gesture_step_since_ms;
+
+static void cart_gesture_reset (void)
+{
+    m_gesture_state = CART_GESTURE_IDLE;
+    m_gesture_tip_count = 0U;
+    m_gesture_waiting_for_upright = false;
+    m_gesture_step_since_ms = 0U;
+}
+
+static void cart_gesture_update (const float angle_deg,
+                                 const uint64_t now_ms)
+{
+    const bool gesture_upright =
+        angle_deg <= CART_GESTURE_UPRIGHT_ANGLE_DEG;
+
+    const bool gesture_tip =
+        (angle_deg >= CART_GESTURE_TIP_ANGLE_DEG) &&
+        (angle_deg < CART_DUMP_ANGLE_DEG);
+
+    /*
+     * Entering the dump orientation invalidates any commissioning gesture in
+     * progress. A normal dump may pass through the gesture angle range, but it
+     * must never contribute toward a commissioning reset.
+     */
+    if (angle_deg >= CART_DUMP_ANGLE_DEG)
+    {
+        cart_gesture_reset();
+        return;
+    }
+
+    if ((m_gesture_state == CART_GESTURE_IN_PROGRESS) &&
+        ((now_ms - m_gesture_step_since_ms) >
+         CART_GESTURE_STEP_TIMEOUT_MS))
+    {
+        cart_gesture_reset();
+    }
+
+    switch (m_gesture_state)
+    {
+        case CART_GESTURE_IDLE:
+            /*
+             * A gesture must begin from the normal upright position.
+             */
+            if (gesture_upright)
+            {
+                m_gesture_state = CART_GESTURE_IN_PROGRESS;
+                m_gesture_tip_count = 0U;
+                m_gesture_waiting_for_upright = false;
+                m_gesture_step_since_ms = now_ms;
+            }
+            break;
+
+        case CART_GESTURE_IN_PROGRESS:
+            if (!m_gesture_waiting_for_upright)
+            {
+                /*
+                 * Wait for the next deliberate tip.
+                 */
+                if (gesture_tip)
+                {
+                    m_gesture_tip_count++;
+                    m_gesture_waiting_for_upright = true;
+                    m_gesture_step_since_ms = now_ms;
+                }
+            }
+            else if (gesture_upright)
+            {
+                /*
+                 * Every tip must be followed by a full return upright.
+                 */
+                if (m_gesture_tip_count >= CART_GESTURE_TIP_COUNT)
+                {
+                    m_gesture_state = CART_GESTURE_WAIT_IDLE;
+                }
+                else
+                {
+                    m_gesture_waiting_for_upright = false;
+                    m_gesture_step_since_ms = now_ms;
+                }
+            }
+            break;
+
+        case CART_GESTURE_WAIT_IDLE:
+            /*
+             * The completed gesture remains valid only while the cart stays in
+             * its commissioning upright posture. cart_idle() performs the reset
+             * once the normal idle timeout has elapsed.
+             */
+            if (!gesture_upright)
+            {
+                cart_gesture_reset();
+            }
+            break;
+
+        default:
+            cart_gesture_reset();
+            break;
+    }
+}
 
 static float cart_angle_from_upright_deg (const float x,
                                           const float y,
@@ -184,6 +300,16 @@ static void cart_idle (void * p_event, uint16_t event_size)
     }
 
     /*
+     * A completed commissioning gesture requests a reboot once the cart has
+     * reached the normal idle condition. Startup will then establish a fresh
+     * upright reference.
+     */
+    if (m_gesture_state == CART_GESTURE_WAIT_IDLE)
+    {
+        NVIC_SystemReset();
+    }
+
+    /*
      * Stop motion evaluation before taking the final sample so the final
      * heartbeat cannot restart the inactivity timer.
      */
@@ -269,6 +395,11 @@ rd_status_t app_cart_motion_init (void)
 
         m_moving_candidate_since_ms = 0U;
         m_last_rolling_motion_ms = 0U;
+
+        m_gesture_state = CART_GESTURE_IDLE;
+        m_gesture_tip_count = 0U;
+        m_gesture_waiting_for_upright = false;
+        m_gesture_step_since_ms = 0U;
 
         err_code |= ri_timer_create (&m_idle_timer,
                                      RI_TIMER_MODE_SINGLE_SHOT,
@@ -456,6 +587,8 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
             m_moving_candidate = false;
             m_moving = false;
         }
+
+        cart_gesture_update (angle_deg, now_ms);
     }
     else
     {
