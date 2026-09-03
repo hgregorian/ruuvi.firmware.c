@@ -166,16 +166,19 @@ static void cart_gesture_update (const float angle_deg,
 
     switch (m_gesture_state)
     {
+
         case CART_GESTURE_IDLE:
             /*
-             * A gesture must begin from the normal upright position.
+             * Wait indefinitely for the first deliberate commissioning tip.
+             * The first accepted tip starts the timed gesture sequence.
              */
-            if (gesture_upright)
+            if (gesture_tip)
             {
                 m_gesture_state = CART_GESTURE_IN_PROGRESS;
-                m_gesture_tip_count = 0U;
-                m_gesture_waiting_for_upright = false;
+                m_gesture_tip_count = 1U;
+                m_gesture_waiting_for_upright = true;
                 m_gesture_step_since_ms = now_ms;
+                m_gesture_diag = CART_GESTURE_DIAG_TIP_1;
             }
             break;
 
@@ -229,10 +232,10 @@ static void cart_gesture_update (const float angle_deg,
              * its commissioning upright posture. cart_idle() performs the reset
              * once the normal idle timeout has elapsed.
              */
-            if (!gesture_upright)
-            {
-                cart_gesture_reset(CART_GESTURE_DIAG_ABORT_WAIT_IDLE);
-            }
+            // if (!gesture_upright)
+            // {
+            //     cart_gesture_reset(CART_GESTURE_DIAG_ABORT_WAIT_IDLE);
+            // }
             break;
 
         default:
