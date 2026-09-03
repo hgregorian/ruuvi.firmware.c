@@ -38,6 +38,15 @@
 #define CART_GESTURE_STEP_TIMEOUT_MS     (5U * 1000U)
 #define CART_GESTURE_TIP_COUNT           (3U)
 
+#define CART_GESTURE_DIAG_NONE            (0U)
+#define CART_GESTURE_DIAG_TIP_1           (1U)
+#define CART_GESTURE_DIAG_TIP_2           (2U)
+#define CART_GESTURE_DIAG_WAIT_IDLE       (3U)
+
+#define CART_GESTURE_DIAG_ABORT_DUMP       (8U)
+#define CART_GESTURE_DIAG_ABORT_TIMEOUT    (9U)
+#define CART_GESTURE_DIAG_ABORT_WAIT_IDLE (10U)
+
 /*
  * Consider the cart inverted when its acceleration vector is at least
  * CART_DUMP_ANGLE_DEG from the upright reference vector.
@@ -97,6 +106,8 @@ static bool m_moving;
 static uint64_t m_moving_candidate_since_ms;
 static uint64_t m_last_rolling_motion_ms;
 
+static uint8_t m_gesture_diag;
+
 typedef enum
 {
     CART_GESTURE_IDLE = 0,
@@ -109,12 +120,13 @@ static uint8_t m_gesture_tip_count;
 static bool m_gesture_waiting_for_upright;
 static uint64_t m_gesture_step_since_ms;
 
-static void cart_gesture_reset (void)
+static void cart_gesture_reset (const uint8_t diag)
 {
     m_gesture_state = CART_GESTURE_IDLE;
     m_gesture_tip_count = 0U;
     m_gesture_waiting_for_upright = false;
     m_gesture_step_since_ms = 0U;
+    m_gesture_diag = diag;
 }
 
 static void cart_gesture_update (const float angle_deg,
@@ -134,7 +146,7 @@ static void cart_gesture_update (const float angle_deg,
      */
     if (angle_deg >= CART_DUMP_ANGLE_DEG)
     {
-        cart_gesture_reset();
+        cart_gesture_reset(CART_GESTURE_DIAG_ABORT_DUMP);
         return;
     }
 
@@ -142,7 +154,8 @@ static void cart_gesture_update (const float angle_deg,
         ((now_ms - m_gesture_step_since_ms) >
          CART_GESTURE_STEP_TIMEOUT_MS))
     {
-        cart_gesture_reset();
+        cart_gesture_reset (CART_GESTURE_DIAG_ABORT_TIMEOUT);
+        return;
     }
 
     switch (m_gesture_state)
@@ -171,6 +184,15 @@ static void cart_gesture_update (const float angle_deg,
                     m_gesture_tip_count++;
                     m_gesture_waiting_for_upright = true;
                     m_gesture_step_since_ms = now_ms;
+               
+                    if (1U == m_gesture_tip_count)
+                    {
+                        m_gesture_diag = CART_GESTURE_DIAG_TIP_1;
+                    }
+                    else if (2U == m_gesture_tip_count)
+                    {
+                        m_gesture_diag = CART_GESTURE_DIAG_TIP_2;
+                    }
                 }
             }
             else if (gesture_upright)
@@ -181,6 +203,7 @@ static void cart_gesture_update (const float angle_deg,
                 if (m_gesture_tip_count >= CART_GESTURE_TIP_COUNT)
                 {
                     m_gesture_state = CART_GESTURE_WAIT_IDLE;
+                    m_gesture_diag = CART_GESTURE_DIAG_WAIT_IDLE;
                 }
                 else
                 {
@@ -198,12 +221,12 @@ static void cart_gesture_update (const float angle_deg,
              */
             if (!gesture_upright)
             {
-                cart_gesture_reset();
+                cart_gesture_reset(CART_GESTURE_DIAG_ABORT_WAIT_IDLE);
             }
             break;
 
         default:
-            cart_gesture_reset();
+            cart_gesture_reset(CART_GESTURE_DIAG_NONE);
             break;
     }
 }
@@ -407,6 +430,7 @@ rd_status_t app_cart_motion_init (void)
         m_gesture_tip_count = 0U;
         m_gesture_waiting_for_upright = false;
         m_gesture_step_since_ms = 0U;
+        m_gesture_diag = CART_GESTURE_DIAG_NONE;
 
         err_code |= ri_timer_create (&m_idle_timer,
                                      RI_TIMER_MODE_SINGLE_SHOT,
@@ -630,20 +654,5 @@ uint8_t app_cart_motion_status_get (void)
 
 uint8_t app_cart_motion_gesture_status_get (void)
 {
-    if (m_gesture_state == CART_GESTURE_WAIT_IDLE)
-    {
-        return 3U;
-    }
-
-    if (m_gesture_tip_count >= 2U)
-    {
-        return 2U;
-    }
-
-    if (m_gesture_tip_count >= 1U)
-    {
-        return 1U;
-    }
-
-    return 0U;
+    return m_gesture_diag;
 }
