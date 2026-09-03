@@ -114,36 +114,18 @@ encode_to_5 (uint8_t * const output,
      *   status 0: NORMAL
      *   status 1: DUMP
      *   status 2: MOVING
-     *   status 3: commissioning gesture diagnostic
+     *   status 3: reserved
      *
-     * During normal operation, bits 5..0 contain the rolling report sequence.
-     * During an active commissioning gesture, the reserved status-3 range
-     * reports accepted gesture progress:
-     *
-     *   193 = first tip accepted
-     *   194 = second tip accepted
-     *   195 = third tip accepted / waiting for idle reset
+     * Bits 5..0 contain the rolling report sequence.
      */
     const uint8_t report_seq =
         (uint8_t) (ep_5_measurement_count & 0x3FU);
- 
-    const uint8_t gesture_status =
-        app_cart_motion_gesture_status_get();
- 
-    if (gesture_status > 0U)
-    {
-        ep_data.movement_count =
-            (uint8_t) ((APP_CART_STATUS_COMMISSIONING << 6U) |
-                       gesture_status);
-    }
-    else
-    {
-        const uint8_t status =
-            app_cart_motion_status_get();
- 
-        ep_data.movement_count =
-            (uint8_t) ((status << 6U) | report_seq);
-    }
+
+    const uint8_t status =
+        app_cart_motion_status_get();
+
+    ep_data.movement_count =
+        (uint8_t) ((status << 6U) | report_seq);
 
     err_code |= ri_radio_address_get (&ep_data.address);
     err_code |= ri_adv_tx_power_get (&ep_data.tx_power);
