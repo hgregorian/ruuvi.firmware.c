@@ -37,6 +37,7 @@
 #define CART_GESTURE_UPRIGHT_ANGLE_DEG   (15.0F)
 #define CART_GESTURE_STEP_TIMEOUT_MS     (5U * 1000U)
 #define CART_GESTURE_TIP_COUNT           (3U)
+#define CART_GESTURE_REFERENCE_SETTLE_MS (1000U)
 
 #define CART_GESTURE_DIAG_NONE            (0U)
 #define CART_GESTURE_DIAG_TIP_1           (1U)
@@ -125,6 +126,17 @@ static cart_gesture_state_t m_gesture_state;
 static uint8_t m_gesture_tip_count;
 static bool m_gesture_waiting_for_upright;
 static uint64_t m_gesture_step_since_ms;
+static uint64_t m_gesture_reference_stable_since_ms;
+
+static void cart_gesture_led_on (void)
+{
+    app_led_error_signal (true);
+}
+
+static void cart_gesture_led_off (void)
+{
+    app_led_error_signal (false);
+}
 
 static void cart_gesture_reset (const uint8_t diag)
 {
@@ -133,13 +145,8 @@ static void cart_gesture_reset (const uint8_t diag)
     m_gesture_waiting_for_upright = false;
     m_gesture_step_since_ms = 0U;
     m_gesture_diag = diag;
-}
 
-static void cart_gesture_tip_ack (void)
-{
-    (void) rt_led_write (RB_LED_RED, true);
-    (void) ri_delay_ms (500U);
-    (void) rt_led_write (RB_LED_RED, false);
+    cart_gesture_led_off();
 }
 
 static void cart_gesture_update (const float angle_deg,
@@ -187,7 +194,7 @@ static void cart_gesture_update (const float angle_deg,
                 m_gesture_step_since_ms = now_ms;
                 m_gesture_diag = CART_GESTURE_DIAG_TIP_1;
 
-                cart_gesture_tip_ack();
+                cart_gesture_led_on();
             }
             break;
 
@@ -216,7 +223,7 @@ static void cart_gesture_update (const float angle_deg,
                         m_gesture_diag = CART_GESTURE_DIAG_TIP_3;
                     }
 
-                    cart_gesture_tip_ack();
+                    cart_gesture_led_on();
                 }
             }
             else if (gesture_upright)
@@ -224,6 +231,9 @@ static void cart_gesture_update (const float angle_deg,
                 /*
                  * Every tip must be followed by a full return upright.
                  */
+
+                cart_gesture_led_off();
+
                 if (m_gesture_tip_count >= CART_GESTURE_TIP_COUNT)
                 {
                     m_gesture_state = CART_GESTURE_WAIT_IDLE;
@@ -416,6 +426,9 @@ static void cart_motion (void * p_event, uint16_t event_size)
         m_active = true;
         m_have_previous_sample = false;
         m_have_gesture_reference = false;
+        m_gesture_reference_stable_since_ms = 0U;
+
+        cart_gesture_reset (CART_GESTURE_DIAG_NONE);
 
         /*
          * Generate fresh telemetry immediately rather than waiting for the
@@ -459,6 +472,7 @@ rd_status_t app_cart_motion_init (void)
         m_gesture_tip_count = 0U;
         m_gesture_waiting_for_upright = false;
         m_gesture_step_since_ms = 0U;
+        m_gesture_reference_stable_since_ms = 0U;
         m_gesture_diag = CART_GESTURE_DIAG_NONE;
 
         err_code |= ri_timer_create (&m_idle_timer,
@@ -523,14 +537,6 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
         m_have_upright_sample = true;
     }
 
-    if (!m_have_gesture_reference)
-    {
-        m_gesture_ref_x = x;
-        m_gesture_ref_y = y;
-        m_gesture_ref_z = z;
-        m_have_gesture_reference = true;
-    }
-
     const float angle_deg =
         cart_angle_from_reference_deg (
             x,
@@ -539,15 +545,6 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
             m_upright_x,
             m_upright_y,
             m_upright_z);
-
-    const float gesture_angle_deg =
-        cart_angle_from_reference_deg (
-            x,
-            y,
-            z,
-            m_gesture_ref_x,
-            m_gesture_ref_y,
-            m_gesture_ref_z);
 
     const bool inverted =
         cart_is_inverted (angle_deg);
@@ -626,6 +623,32 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
         const bool sample_moving =
             delta_g2 >= CART_SAMPLE_MOTION_G2;
 
+        /*
+         * Establish the commissioning gesture reference only after the cart has
+         * remained stationary for CART_GESTURE_REFERENCE_SETTLE_MS. This avoids
+         * capturing a partially tipped orientation from the motion which woke the
+         * device.
+         */
+        if (!m_have_gesture_reference)
+        {
+            if (sample_moving)
+            {
+                m_gesture_reference_stable_since_ms = now_ms;
+            }
+            else if (0U == m_gesture_reference_stable_since_ms)
+            {
+                m_gesture_reference_stable_since_ms = now_ms;
+            }
+            else if ((now_ms - m_gesture_reference_stable_since_ms) >=
+                     CART_GESTURE_REFERENCE_SETTLE_MS)
+            {
+                m_gesture_ref_x = x;
+                m_gesture_ref_y = y;
+                m_gesture_ref_z = z;
+                m_have_gesture_reference = true;
+            }
+        }
+
         const bool rolling_motion =
             sample_moving && rolling;
 
@@ -671,7 +694,19 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
             m_moving = false;
         }
 
-        cart_gesture_update (gesture_angle_deg, now_ms);
+        if (m_have_gesture_reference)
+        {
+            const float gesture_angle_deg =
+                cart_angle_from_reference_deg (
+                    x,
+                    y,
+                    z,
+                    m_gesture_ref_x,
+                    m_gesture_ref_y,
+                    m_gesture_ref_z);
+
+            cart_gesture_update (gesture_angle_deg, now_ms);
+        }
     }
     else
     {
