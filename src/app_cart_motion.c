@@ -627,3 +627,23 @@ uint8_t app_cart_motion_status_get (void)
 
     return APP_CART_STATUS_NORMAL;
 }
+
+uint8_t app_cart_motion_gesture_status_get (void)
+{
+    if (m_gesture_state == CART_GESTURE_WAIT_IDLE)
+    {
+        return 3U;
+    }
+
+    if (m_gesture_tip_count >= 2U)
+    {
+        return 2U;
+    }
+
+    if (m_gesture_tip_count >= 1U)
+    {
+        return 1U;
+    }
+
+    return 0U;
+}
