@@ -135,6 +135,13 @@ static void cart_gesture_reset (const uint8_t diag)
     m_gesture_diag = diag;
 }
 
+static void cart_gesture_tip_ack (void)
+{
+    (void) rt_led_write (RB_LED_RED, true);
+    (void) ri_delay_ms (500U);
+    (void) rt_led_write (RB_LED_RED, false);
+}
+
 static void cart_gesture_update (const float angle_deg,
                                  const uint64_t now_ms)
 {
@@ -179,6 +186,8 @@ static void cart_gesture_update (const float angle_deg,
                 m_gesture_waiting_for_upright = true;
                 m_gesture_step_since_ms = now_ms;
                 m_gesture_diag = CART_GESTURE_DIAG_TIP_1;
+
+                cart_gesture_tip_ack();
             }
             break;
 
@@ -206,6 +215,8 @@ static void cart_gesture_update (const float angle_deg,
                     {
                         m_gesture_diag = CART_GESTURE_DIAG_TIP_3;
                     }
+
+                    cart_gesture_tip_ack();
                 }
             }
             else if (gesture_upright)
