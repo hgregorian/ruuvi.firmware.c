@@ -41,7 +41,8 @@
 #define CART_GESTURE_DIAG_NONE            (0U)
 #define CART_GESTURE_DIAG_TIP_1           (1U)
 #define CART_GESTURE_DIAG_TIP_2           (2U)
-#define CART_GESTURE_DIAG_WAIT_IDLE       (3U)
+#define CART_GESTURE_DIAG_TIP_3           (3U)
+#define CART_GESTURE_DIAG_WAIT_IDLE       (4U)
 
 #define CART_GESTURE_DIAG_ABORT_DUMP       (8U)
 #define CART_GESTURE_DIAG_ABORT_TIMEOUT    (9U)
@@ -192,6 +193,10 @@ static void cart_gesture_update (const float angle_deg,
                     else if (2U == m_gesture_tip_count)
                     {
                         m_gesture_diag = CART_GESTURE_DIAG_TIP_2;
+                    }
+                    else if (3U == m_gesture_tip_count)
+                    {
+                        m_gesture_diag = CART_GESTURE_DIAG_TIP_3;
                     }
                 }
             }
