@@ -10,6 +10,8 @@
 #include "app_config.h"
 #include "app_heartbeat.h"
 #include "app_led.h"
+#include "ruuvi_boards.h"
+#include "ruuvi_task_led.h"
 #include "ruuvi_interface_power.h"
 #include "ruuvi_interface_rtc.h"
 #include "ruuvi_interface_scheduler.h"
@@ -309,8 +311,8 @@ static void cart_idle (void * p_event, uint16_t event_size)
      */
     if (m_gesture_state == CART_GESTURE_WAIT_IDLE)
     {
-        app_led_error_signal (true);
-        (void) ri_delay_ms (2000U);
+        (void) rt_led_write (RB_LED_RED, true);
+        (void) ri_delay_ms (5000U);
         ri_power_reset();
     }
 
