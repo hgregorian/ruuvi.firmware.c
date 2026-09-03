@@ -126,14 +126,22 @@ static uint8_t m_gesture_tip_count;
 static bool m_gesture_waiting_for_upright;
 static uint64_t m_gesture_step_since_ms;
 
-static void cart_gesture_led_on (void)
+static void cart_gesture_blink (const uint32_t duration_ms)
 {
     app_led_error_signal (true);
+    (void) ri_delay_ms (duration_ms);
+    app_led_error_signal (false);
 }
 
-static void cart_gesture_led_off (void)
+static void cart_gesture_confirm_blink (void)
 {
-    app_led_error_signal (false);
+    for (uint8_t ii = 0U; ii < 5U; ii++)
+    {
+        app_led_error_signal (true);
+        (void) ri_delay_ms (250U);
+        app_led_error_signal (false);
+        (void) ri_delay_ms (250U);
+    }
 }
 
 static void cart_gesture_reset (const uint8_t diag)
@@ -144,7 +152,7 @@ static void cart_gesture_reset (const uint8_t diag)
     m_gesture_step_since_ms = 0U;
     m_gesture_diag = diag;
 
-    cart_gesture_led_off();
+    app_led_error_signal (false);
 }
 
 static void cart_gesture_update (const float angle_deg,
@@ -192,7 +200,7 @@ static void cart_gesture_update (const float angle_deg,
                 m_gesture_step_since_ms = now_ms;
                 m_gesture_diag = CART_GESTURE_DIAG_TIP_1;
 
-                cart_gesture_led_on();
+                cart_gesture_blink (500U);
             }
             break;
 
@@ -221,7 +229,7 @@ static void cart_gesture_update (const float angle_deg,
                         m_gesture_diag = CART_GESTURE_DIAG_TIP_3;
                     }
 
-                    cart_gesture_led_on();
+                    cart_gesture_blink (500U);
                 }
             }
             else if (gesture_upright)
@@ -230,7 +238,7 @@ static void cart_gesture_update (const float angle_deg,
                  * Every tip must be followed by a full return upright.
                  */
 
-                cart_gesture_led_off();
+                cart_gesture_blink (500U);
 
                 if (m_gesture_tip_count >= CART_GESTURE_TIP_COUNT)
                 {
@@ -369,8 +377,7 @@ static void cart_idle (void * p_event, uint16_t event_size)
      */
     if (m_gesture_state == CART_GESTURE_WAIT_IDLE)
     {
-        (void) rt_led_write (RB_LED_RED, true);
-        (void) ri_delay_ms (5000U);
+        cart_gesture_confirm_blink();
         ri_power_reset();
     }
 
