@@ -348,17 +348,6 @@ static void cart_idle (void * p_event, uint16_t event_size)
      */
     const uint64_t now_ms = ri_rtc_millis();
 
-    /*
-     * While dump state is asserted, remain out of idle telemetry mode.
-     * app_cart_motion_on_sample() clears the state only after the minimum
-     * hold interval has elapsed and the cart has returned upright.
-     */
-    if (m_dump_latched)
-    {
-        cart_idle_timer_restart();
-        return;
-    }
-
     const uint64_t quiet_ms = now_ms - m_last_motion_ms;
 
     if (quiet_ms < CART_IDLE_TIMEOUT_MS)
@@ -368,6 +357,19 @@ static void cart_idle (void * p_event, uint16_t event_size)
 
         (void) ri_timer_start (m_idle_timer, remaining_ms, NULL);
         return;
+    }
+
+    /*
+     * A real dump necessarily involves continuing physical motion. If the
+     * cart has been completely quiet for the full idle timeout, any remaining
+     * DUMP latch is stale and must not prevent recovery to idle.
+     */
+    if (m_dump_latched)
+    {
+        m_dump_latched = false;
+        m_dump_candidate = false;
+        m_dump_armed = true;
+        m_dump_fast = false;
     }
 
     /*
