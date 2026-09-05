@@ -27,7 +27,8 @@
 
 #define CART_MOTION_INTERVAL_MS     (200U)
 #define CART_DUMP_INTERVAL_MS       (100U)
-#define CART_IDLE_INTERVAL_MS       (120U * 1000U)
+// #define CART_IDLE_INTERVAL_MS       (120U * 1000U)
+#define CART_IDLE_INTERVAL_MS       (1000U)
 #define CART_IDLE_TIMEOUT_MS        (5000U)
 
 #define CART_DUMP_CONFIRM_MS        (300U)
