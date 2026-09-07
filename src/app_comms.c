@@ -57,6 +57,7 @@ typedef struct
 #endif
 
 static volatile bool m_tx_done; //!< Flag for data transfer done
+static volatile bool m_config_enable_after_disconnect; //!< Rebuild GATT in config mode after a real GAP disconnect.
 static uint8_t m_bleadv_repeat_count; //!< Number of times to repeat advertisement.
 TESTABLE_STATIC ri_timer_id_t m_comm_timer;    //!< Timer for communication mode changes.
 TESTABLE_STATIC mode_changes_t m_mode_ops;     //!< Pending mode changes.
@@ -208,9 +209,11 @@ static rd_status_t wait_for_tx_done (const uint32_t timeout_ms)
 }
 
 static rd_status_t password_check (const ri_comm_xfer_fp_t reply_fp,
-                                   const uint8_t * const raw_message)
+                                   const uint8_t * const raw_message,
+                                   bool * const p_disconnect_requested)
 {
     rd_status_t err_code = RD_SUCCESS;
+    *p_disconnect_requested = false;
     uint64_t entered_password = 0U;
     bool auth_ok = false;
     // Use non-zero initial value so passwords won't match on error
@@ -250,7 +253,19 @@ static rd_status_t password_check (const ri_comm_xfer_fp_t reply_fp,
 
     if (auth_ok)
     {
-        app_comms_configure_next_enable ();
+        /*
+         * Do not tear down the SoftDevice underneath the live connection.
+         * Request a normal GAP disconnect first. handle_gatt_disconnected()
+         * will rebuild GATT in configuration mode after the disconnect event.
+         */
+        m_config_enable_after_disconnect = true;
+        const rd_status_t disconnect_status = rt_gatt_disconnect();
+        err_code |= disconnect_status;
+
+        if (RD_SUCCESS == disconnect_status)
+        {
+            *p_disconnect_requested = true;
+        }
     }
     else
     {
@@ -286,6 +301,7 @@ TESTABLE_STATIC void handle_comms (const ri_comm_xfer_fp_t reply_fp, void * p_da
         err_code |= ri_gatt_params_request (RI_GATT_TURBO, CONN_PARAM_UPDATE_DELAY_MS);
         // Parse message type.
         re_type_t type = raw_message[RE_STANDARD_DESTINATION_INDEX];
+        bool disconnect_requested = false;
 
         // Route message to proper handler.
         switch (type)
@@ -306,11 +322,22 @@ TESTABLE_STATIC void handle_comms (const ri_comm_xfer_fp_t reply_fp, void * p_da
                 break;
 
             case RE_SEC_PASS:
-                err_code |= password_check (reply_fp, raw_message);
+                err_code |= password_check (reply_fp, raw_message, &disconnect_requested);
                 break;
 
             default:
                 break;
+        }
+
+        /*
+         * An authenticated password command has requested an asynchronous GAP
+         * disconnect.  Do not touch connection parameters or restart heartbeat
+         * processing on a link that is now being torn down.
+         */
+        if (disconnect_requested)
+        {
+            RD_ERROR_CHECK (err_code, ~RD_ERROR_FATAL);
+            return;
         }
 
         // Switch GATT to slower params.
@@ -383,7 +410,37 @@ TESTABLE_STATIC void on_gatt_connected_isr (void * p_data, size_t data_len)
 TESTABLE_STATIC void handle_gatt_disconnected (void * p_data, uint16_t data_len)
 {
     rd_status_t err_code = RD_SUCCESS;
-    config_cleanup_on_disconnect();
+
+    if (m_config_enable_after_disconnect)
+    {
+        /*
+         * The link is now genuinely down. It is safe to cycle the BLE/GATT
+         * stack and expose the configuration + buttonless DFU services.
+         */
+        m_config_enable_after_disconnect = false;
+        m_config_enabled_on_curr_conn = false;
+        m_mode_ops.disable_config = 1;
+
+        err_code |= enable_config_on_next_conn (true);
+        err_code |= ri_timer_stop (m_comm_timer);
+        err_code |= ri_timer_start (m_comm_timer,
+                                    APP_CONFIG_ENABLED_TIME_MS,
+                                    &m_mode_ops);
+
+        /*
+         * handle_comms() stopped heartbeat processing before the authenticated
+         * password command was handled. In the graceful-disconnect path we
+         * intentionally skip restarting it on the old link, so resume it only
+         * after the real disconnect event has arrived and config-mode GATT has
+         * been rebuilt.
+         */
+        err_code |= app_heartbeat_start();
+    }
+    else
+    {
+        config_cleanup_on_disconnect();
+    }
+
     RD_ERROR_CHECK (err_code, RD_SUCCESS);
 }
 
