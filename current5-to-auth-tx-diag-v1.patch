@@ -1,0 +1,381 @@
+diff -ruN /mnt/data/ruuvi_input5/ruuvi.firmware.c/src/app_comms.c /mnt/data/ruuvi_instr_work/ruuvi.firmware.c/src/app_comms.c
+--- /mnt/data/ruuvi_input5/ruuvi.firmware.c/src/app_comms.c	2026-09-06 05:36:47.000000000 +0000
++++ /mnt/data/ruuvi_instr_work/ruuvi.firmware.c/src/app_comms.c	2026-09-06 06:12:25.852315210 +0000
+@@ -18,8 +18,6 @@
+ #include "ruuvi_task_communication.h"
+ #include "ruuvi_task_gatt.h"
+ #include "ruuvi_task_nfc.h"
+-#include "ruuvi_task_flash.h"
+-#include "nrf_soc.h"
+ #include <stdio.h>
+ #include <string.h>
+ 
+@@ -211,74 +209,86 @@
+     return err_code;
+ }
+ 
+-static uint16_t fatal_file_hash (const char * const filename)
++/*
++ * Live diagnostic for the authentication TX path.  This deliberately runs
++ * only after the original authentication wait has completed, so it cannot
++ * change the result we are trying to measure.  Diagnostic send/wait errors
++ * are ignored and never feed the production error path.
++ *
++ * Packet ATX v1 (12 bytes):
++ *   41 54 58 01 RR RR RR RR WW WW WW WW
++ *   A  T  X  v1 <reply status LE> <wait status LE>
++ */
++static void auth_tx_diag_send (const ri_comm_xfer_fp_t reply_fp,
++                               const rd_status_t reply_status,
++                               const rd_status_t wait_status)
+ {
+-    const char * basename = filename;
+-
+-    for (const char * p = filename; '\0' != *p; ++p)
+-    {
+-        if (('/' == *p) || ('\\' == *p))
+-        {
+-            basename = p + 1;
+-        }
+-    }
++    ri_comm_message_t msg = {0};
++    msg.data_length = 12U;
++    msg.repeat_count = 1U;
++    msg.data[0] = 0x41U; /* A */
++    msg.data[1] = 0x54U; /* T */
++    msg.data[2] = 0x58U; /* X */
++    msg.data[3] = 0x01U; /* version */
++    msg.data[4] = (uint8_t) ((reply_status >> 0U) & 0xFFU);
++    msg.data[5] = (uint8_t) ((reply_status >> 8U) & 0xFFU);
++    msg.data[6] = (uint8_t) ((reply_status >> 16U) & 0xFFU);
++    msg.data[7] = (uint8_t) ((reply_status >> 24U) & 0xFFU);
++    msg.data[8] = (uint8_t) ((wait_status >> 0U) & 0xFFU);
++    msg.data[9] = (uint8_t) ((wait_status >> 8U) & 0xFFU);
++    msg.data[10] = (uint8_t) ((wait_status >> 16U) & 0xFFU);
++    msg.data[11] = (uint8_t) ((wait_status >> 24U) & 0xFFU);
+ 
+-    /* 16-bit FNV-1a over the basename; deterministic across build paths. */
+-    uint16_t hash = 0x811CU;
++    m_tx_done = false;
++    const rd_status_t diag_send_status = reply_fp (&msg);
+ 
+-    for (const uint8_t * p = (const uint8_t *) basename; '\0' != *p; ++p)
++    if (RD_SUCCESS == diag_send_status)
+     {
+-        hash ^= *p;
+-        hash = (uint16_t) (hash * 0x0193U);
++        /*
++         * Give the diagnostic notification the same bounded opportunity to
++         * reach the central.  This happens after wait_status was captured.
++         * Its result is intentionally discarded.
++         */
++        (void) wait_for_tx_done (BLOCKING_COMM_TIMEOUT_MS);
+     }
+-
+-    return hash;
+ }
+ 
+-static rd_status_t report_previous_fatal_error (const ri_comm_xfer_fp_t reply_fp)
++/*
++ * If the GAP disconnect request itself fails, report that status while the
++ * original link should still be available.  No packet is sent for RD_SUCCESS
++ * to avoid adding another notification to the normal transition.
++ *
++ * Packet ADE v1 (8 bytes):
++ *   41 44 45 01 DD DD DD DD
++ *   A  D  E  v1 <disconnect status LE>
++ */
++static void auth_disconnect_error_diag_send (const ri_comm_xfer_fp_t reply_fp,
++                                             const rd_status_t disconnect_status)
+ {
+-    rt_flash_error_cause_t cause = {0};
+-    rd_status_t err_code = rt_flash_error_load (&cause);
+-
+-    if (RD_SUCCESS != err_code)
++    if (RD_SUCCESS == disconnect_status)
+     {
+-        /* No record is the normal case. Do not turn it into a comms error. */
+-        return RD_SUCCESS;
++        return;
+     }
+ 
+     ri_comm_message_t msg = {0};
+-    const uint16_t file_hash = fatal_file_hash (cause.filename);
+-    const uint16_t line = (cause.line < 0) ? 0U : (uint16_t) cause.line;
+-
+-    msg.data_length = RE_STANDARD_MESSAGE_LENGTH;
+-    msg.repeat_count = 1;
+-    msg.data[0] = 0x46U; /* F */
+-    msg.data[1] = 0x41U; /* A */
+-    msg.data[2] = 0x54U; /* T */
+-    msg.data[3] = (uint8_t) ((cause.error >> 0U) & 0xFFU);
+-    msg.data[4] = (uint8_t) ((cause.error >> 8U) & 0xFFU);
+-    msg.data[5] = (uint8_t) ((cause.error >> 16U) & 0xFFU);
+-    msg.data[6] = (uint8_t) ((cause.error >> 24U) & 0xFFU);
+-    msg.data[7] = (uint8_t) ((line >> 0U) & 0xFFU);
+-    msg.data[8] = (uint8_t) ((line >> 8U) & 0xFFU);
+-    msg.data[9] = (uint8_t) ((file_hash >> 0U) & 0xFFU);
+-    msg.data[10] = (uint8_t) ((file_hash >> 8U) & 0xFFU);
++    msg.data_length = 8U;
++    msg.repeat_count = 1U;
++    msg.data[0] = 0x41U; /* A */
++    msg.data[1] = 0x44U; /* D */
++    msg.data[2] = 0x45U; /* E */
++    msg.data[3] = 0x01U; /* version */
++    msg.data[4] = (uint8_t) ((disconnect_status >> 0U) & 0xFFU);
++    msg.data[5] = (uint8_t) ((disconnect_status >> 8U) & 0xFFU);
++    msg.data[6] = (uint8_t) ((disconnect_status >> 16U) & 0xFFU);
++    msg.data[7] = (uint8_t) ((disconnect_status >> 24U) & 0xFFU);
+ 
+     m_tx_done = false;
+-    err_code = reply_fp (&msg);
+-
+-    if (RD_SUCCESS == err_code)
+-    {
+-        err_code = wait_for_tx_done (BLOCKING_COMM_TIMEOUT_MS);
+-    }
++    const rd_status_t diag_send_status = reply_fp (&msg);
+ 
+-    if (RD_SUCCESS == err_code)
++    if (RD_SUCCESS == diag_send_status)
+     {
+-        /* Best-effort cleanup; never make DFU depend on diagnostic deletion. */
+-        (void) rt_flash_error_free();
++        (void) wait_for_tx_done (BLOCKING_COMM_TIMEOUT_MS);
+     }
+-
+-    return err_code;
+ }
+ 
+ static rd_status_t password_check (const ri_comm_xfer_fp_t reply_fp,
+@@ -310,27 +320,32 @@
+     }
+ 
+     m_tx_done = false;
++    rd_status_t reply_status = RD_SUCCESS;
+ 
+     if (entered_password == current_password)
+     {
+-        err_code |= reply_authorized (reply_fp, raw_message);
++        reply_status = reply_authorized (reply_fp, raw_message);
++        err_code |= reply_status;
+         auth_ok = true;
+     }
+     else
+     {
+-        err_code |= reply_unauthorized (reply_fp, raw_message);
++        reply_status = reply_unauthorized (reply_fp, raw_message);
++        err_code |= reply_status;
+         auth_ok = false;
+     }
+ 
+-    err_code |= wait_for_tx_done (BLOCKING_COMM_TIMEOUT_MS);
++    const rd_status_t wait_status = wait_for_tx_done (BLOCKING_COMM_TIMEOUT_MS);
++    err_code |= wait_status;
+ 
+     if (auth_ok)
+     {
+         /*
+-         * If the preceding boot ended in app_on_error(), report its exact
+-         * error/line/source hash before starting another config transition.
++         * Capture the two statuses that precede the config transition while
++         * the old NUS link is still available.  This diagnostic runs only
++         * after the original wait has finished, and its own errors are ignored.
+          */
+-        (void) report_previous_fatal_error (reply_fp);
++        auth_tx_diag_send (reply_fp, reply_status, wait_status);
+ 
+         /*
+          * Do not tear down the SoftDevice underneath the live connection.
+@@ -345,6 +360,10 @@
+         {
+             *p_disconnect_requested = true;
+         }
++        else
++        {
++            auth_disconnect_error_diag_send (reply_fp, disconnect_status);
++        }
+     }
+     else
+     {
+diff -ruN /mnt/data/ruuvi_input5/ruuvi.firmware.c/src/main.c /mnt/data/ruuvi_instr_work/ruuvi.firmware.c/src/main.c
+--- /mnt/data/ruuvi_input5/ruuvi.firmware.c/src/main.c	2026-09-06 05:36:47.000000000 +0000
++++ /mnt/data/ruuvi_instr_work/ruuvi.firmware.c/src/main.c	2026-09-06 06:12:25.129870463 +0000
+@@ -50,14 +50,12 @@
+                    const char * file,
+                    const int line)
+ {
++    (void) error;
++    (void) file;
++    (void) line;
++
+     if (fatal)
+     {
+-        /*
+-         * Persist the exact rd_error_check() input before resetting.
+-         * This uses normal application flash only; no GPREGRET/GPREGRET2 or
+-         * other bootloader-facing retained state is touched.
+-         */
+-        (void) rt_flash_error_store (error, file, line);
+         ri_power_reset();
+     }
+ }
+diff -ruN /mnt/data/ruuvi_input5/ruuvi.firmware.c/src/ruuvi.drivers.c/src/tasks/ruuvi_task_flash.c /mnt/data/ruuvi_instr_work/ruuvi.firmware.c/src/ruuvi.drivers.c/src/tasks/ruuvi_task_flash.c
+--- /mnt/data/ruuvi_input5/ruuvi.firmware.c/src/ruuvi.drivers.c/src/tasks/ruuvi_task_flash.c	2026-09-06 05:36:47.000000000 +0000
++++ /mnt/data/ruuvi_instr_work/ruuvi.firmware.c/src/ruuvi.drivers.c/src/tasks/ruuvi_task_flash.c	2026-09-06 06:12:25.131820475 +0000
+@@ -51,8 +51,12 @@
+ #define LOGW(msg) ri_log(RI_LOG_WARNING, msg)
+ #define LOGHEX(msg, len) ri_log_hex(TASK_FLASH_LOG_LEVEL, msg, len)
+ 
+-/* Keep the asynchronous FDS write buffer alive until reset/completion. */
+-static rt_flash_error_cause_t m_fatal_error_cause;
++typedef struct
++{
++    rd_status_t error;
++    char filename[32];
++    int line;
++} rt_flash_error_cause_t;
+ 
+ #if 0
+ static void on_error (const rd_status_t err,
+@@ -98,7 +102,9 @@
+ {
+     rt_flash_error_cause_t error;
+     rd_status_t err_code;
+-    err_code = rt_flash_error_load (&error);
++    err_code = rt_flash_load (RT_FLASH_ERROR_FILE,
++                              RT_FLASH_ERROR_RECORD,
++                              &error, sizeof (error));
+ 
+     if (RD_SUCCESS == err_code)
+     {
+@@ -166,66 +172,6 @@
+     return ri_flash_record_delete (file_id, record_id);
+ }
+ 
+-rd_status_t rt_flash_error_store (const rd_status_t error,
+-                                  const char * const file,
+-                                  const int line)
+-{
+-    if (NULL == file)
+-    {
+-        return RD_ERROR_NULL;
+-    }
+-
+-    memset (&m_fatal_error_cause, 0, sizeof (m_fatal_error_cause));
+-    m_fatal_error_cause.error = error;
+-    m_fatal_error_cause.line = line;
+-    strncpy (m_fatal_error_cause.filename, file,
+-             sizeof (m_fatal_error_cause.filename) - 1U);
+-    m_fatal_error_cause.filename[sizeof (m_fatal_error_cause.filename) - 1U] = '\0';
+-
+-    /*
+-     * Deliberately use the lower-level record write here instead of
+-     * rt_flash_store().  A fatal-error callback must not trigger GC/yield
+-     * loops while the application is already unwinding toward reset.
+-     * This is best-effort diagnostics: if the write cannot be queued, the
+-     * normal reset still proceeds.
+-     */
+-    rd_status_t status = ri_flash_record_set (RT_FLASH_ERROR_FILE,
+-                                              RT_FLASH_ERROR_RECORD,
+-                                              sizeof (m_fatal_error_cause),
+-                                              &m_fatal_error_cause);
+-
+-    if (RD_SUCCESS == status)
+-    {
+-        uint32_t timeout_ms = 0U;
+-
+-        while ((timeout_ms < 1000U) && ri_flash_is_busy())
+-        {
+-            ++timeout_ms;
+-            (void) ri_delay_us (1000U);
+-        }
+-    }
+-
+-    return status;
+-}
+-
+-rd_status_t rt_flash_error_load (rt_flash_error_cause_t * const p_error)
+-{
+-    if (NULL == p_error)
+-    {
+-        return RD_ERROR_NULL;
+-    }
+-
+-    return rt_flash_load (RT_FLASH_ERROR_FILE,
+-                          RT_FLASH_ERROR_RECORD,
+-                          p_error,
+-                          sizeof (*p_error));
+-}
+-
+-rd_status_t rt_flash_error_free (void)
+-{
+-    return rt_flash_free (RT_FLASH_ERROR_FILE, RT_FLASH_ERROR_RECORD);
+-}
+-
+ rd_status_t rt_flash_gc_run (void)
+ {
+     return ri_flash_gc_run();
+@@ -264,26 +210,5 @@
+ {
+     return false;
+ }
+-
+-rd_status_t rt_flash_error_store (const rd_status_t error,
+-                                  const char * const file,
+-                                  const int line)
+-{
+-    (void) error;
+-    (void) file;
+-    (void) line;
+-    return RD_ERROR_NOT_ENABLED;
+-}
+-
+-rd_status_t rt_flash_error_load (rt_flash_error_cause_t * const p_error)
+-{
+-    (void) p_error;
+-    return RD_ERROR_NOT_FOUND;
+-}
+-
+-rd_status_t rt_flash_error_free (void)
+-{
+-    return RD_ERROR_NOT_ENABLED;
+-}
+ #endif
+ /*@}*/
+diff -ruN /mnt/data/ruuvi_input5/ruuvi.firmware.c/src/ruuvi.drivers.c/src/tasks/ruuvi_task_flash.h /mnt/data/ruuvi_instr_work/ruuvi.firmware.c/src/ruuvi.drivers.c/src/tasks/ruuvi_task_flash.h
+--- /mnt/data/ruuvi_input5/ruuvi.firmware.c/src/ruuvi.drivers.c/src/tasks/ruuvi_task_flash.h	2026-09-06 05:36:00.000000000 +0000
++++ /mnt/data/ruuvi_instr_work/ruuvi.firmware.c/src/ruuvi.drivers.c/src/tasks/ruuvi_task_flash.h	2026-09-06 06:12:25.133786642 +0000
+@@ -48,14 +48,6 @@
+ #include "ruuvi_interface_flash.h"
+ #include "ruuvi_interface_log.h"
+ 
+-/** Persistent fatal-error record used for post-reset diagnostics. */
+-typedef struct
+-{
+-    rd_status_t error;
+-    char filename[32];
+-    int line;
+-} rt_flash_error_cause_t;
+-
+ /**
+  * @brief Initialize flash storage.
+  *
+@@ -170,17 +162,6 @@
+  */
+ bool rt_flash_busy (void);
+ 
+-/** Store a fatal error cause without touching bootloader retention registers. */
+-rd_status_t rt_flash_error_store (const rd_status_t error,
+-                                  const char * const file,
+-                                  const int line);
+-
+-/** Load the previously stored fatal error cause. */
+-rd_status_t rt_flash_error_load (rt_flash_error_cause_t * const p_error);
+-
+-/** Delete the previously stored fatal error cause. */
+-rd_status_t rt_flash_error_free (void);
+-
+ #ifdef CEEDLING
+ // Give Ceedling access to internal functions.
+ void print_error_cause (void);

@@ -4,12 +4,14 @@
 #include "app_led.h"
 #include "app_sensor.h"
 #include "app_testing.h"
+#include "main.h"
 #include "ruuvi_boards.h"
 #include "ruuvi_endpoints.h"
 #include "ruuvi_interface_communication.h"
 #include "ruuvi_interface_communication_ble_advertising.h"
 #include "ruuvi_interface_communication_ble_gatt.h"
 #include "ruuvi_interface_communication_radio.h"
+#include "ruuvi_interface_power.h"
 #include "ruuvi_interface_rtc.h"
 #include "ruuvi_interface_scheduler.h"
 #include "ruuvi_interface_timer.h"
@@ -18,6 +20,7 @@
 #include "ruuvi_task_communication.h"
 #include "ruuvi_task_gatt.h"
 #include "ruuvi_task_nfc.h"
+#include "ruuvi_task_flash.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -57,6 +60,7 @@ typedef struct
 #endif
 
 static volatile bool m_tx_done; //!< Flag for data transfer done
+static volatile bool m_config_enable_after_disconnect; //!< Rebuild GATT in config mode after a real GAP disconnect.
 static uint8_t m_bleadv_repeat_count; //!< Number of times to repeat advertisement.
 TESTABLE_STATIC ri_timer_id_t m_comm_timer;    //!< Timer for communication mode changes.
 TESTABLE_STATIC mode_changes_t m_mode_ops;     //!< Pending mode changes.
@@ -182,6 +186,7 @@ static rd_status_t enable_config_on_next_conn (const bool enable)
     // Kicks out current connection.
     err_code |= app_comms_ble_uninit();
     err_code |= app_comms_ble_init (!enable);
+
     m_config_enabled_on_next_conn = enable;
     app_led_configuration_signal (enable);
     return err_code;
@@ -208,9 +213,11 @@ static rd_status_t wait_for_tx_done (const uint32_t timeout_ms)
 }
 
 static rd_status_t password_check (const ri_comm_xfer_fp_t reply_fp,
-                                   const uint8_t * const raw_message)
+                                   const uint8_t * const raw_message,
+                                   bool * const p_disconnect_requested)
 {
     rd_status_t err_code = RD_SUCCESS;
+    *p_disconnect_requested = false;
     uint64_t entered_password = 0U;
     bool auth_ok = false;
     // Use non-zero initial value so passwords won't match on error
@@ -234,15 +241,18 @@ static rd_status_t password_check (const ri_comm_xfer_fp_t reply_fp,
     }
 
     m_tx_done = false;
+    rd_status_t reply_status = RD_SUCCESS;
 
     if (entered_password == current_password)
     {
-        err_code |= reply_authorized (reply_fp, raw_message);
+        reply_status = reply_authorized (reply_fp, raw_message);
+        err_code |= reply_status;
         auth_ok = true;
     }
     else
     {
-        err_code |= reply_unauthorized (reply_fp, raw_message);
+        reply_status = reply_unauthorized (reply_fp, raw_message);
+        err_code |= reply_status;
         auth_ok = false;
     }
 
@@ -250,7 +260,19 @@ static rd_status_t password_check (const ri_comm_xfer_fp_t reply_fp,
 
     if (auth_ok)
     {
-        app_comms_configure_next_enable ();
+        /*
+         * Do not tear down the SoftDevice underneath the live connection.
+         * Request a normal GAP disconnect first. handle_gatt_disconnected()
+         * will rebuild GATT in configuration mode after the disconnect event.
+         */
+        m_config_enable_after_disconnect = true;
+        const rd_status_t disconnect_status = rt_gatt_disconnect();
+        err_code |= disconnect_status;
+
+        if (RD_SUCCESS == disconnect_status)
+        {
+            *p_disconnect_requested = true;
+        }
     }
     else
     {
@@ -258,6 +280,167 @@ static rd_status_t password_check (const ri_comm_xfer_fp_t reply_fp,
     }
 
     return  err_code;
+}
+
+
+#define POSTMORTEM_CMD_REPORT "DIAG?"
+#define POSTMORTEM_CMD_CRASH  "CRASH"
+#define POSTMORTEM_CMD_CLEAR  "CLEAR"
+#define POSTMORTEM_CMD_RESET  "RSET!"
+#define POSTMORTEM_CMD_LEN     (5U)
+
+static uint16_t postmortem_filename_hash (const char * filename)
+{
+    uint16_t hash = 0x811CU;
+
+    if (NULL == filename)
+    {
+        return 0U;
+    }
+
+    while ('\0' != *filename)
+    {
+        hash ^= (uint8_t) *filename;
+        hash = (uint16_t) (hash * 0x0193U);
+        filename++;
+    }
+
+    return hash;
+}
+
+/*
+ * PM v2 packet, exactly 20 bytes:
+ *
+ *   50 4D 02 SS FF RR RR RR RR EE EE EE EE LL LL HH HH TT TT 00
+ *   P  M v2 src flg <boot RESETREAS> <fatal error> <line> <file hash>
+ *              <flash-load status low 16 bits> <reserved>
+ *
+ * SS is a persisted rt_reset_source_t.
+ * FF bit 0 = post-mortem record valid, bit 1 = fatal record valid.
+ * RESETREAS is captured at application entry and the sticky hardware bits are
+ * then cleared, so the value belongs to this boot rather than an older reset.
+ */
+static void postmortem_report_send (const ri_comm_xfer_fp_t reply_fp)
+{
+    rt_flash_postmortem_record_t record = {0};
+    const rd_status_t load_status = rt_flash_postmortem_load (&record);
+    const bool record_valid = (RD_SUCCESS == load_status)
+                              && (RT_FLASH_POSTMORTEM_MAGIC == record.magic);
+    const bool fatal_valid = record_valid && (0U != record.fatal_valid);
+
+    ri_comm_message_t msg = {0};
+    msg.data_length = 20U;
+    msg.repeat_count = 1U;
+    msg.data[0] = 0x50U; /* P */
+    msg.data[1] = 0x4DU; /* M */
+    msg.data[2] = 0x02U; /* version */
+    msg.data[3] = record_valid ? record.reset_source : (uint8_t) RT_RESET_SOURCE_NONE;
+    msg.data[4] = (record_valid ? 0x01U : 0U) | (fatal_valid ? 0x02U : 0U);
+
+    const uint32_t resetreas = app_boot_resetreas_get();
+    msg.data[5] = (uint8_t) ((resetreas >> 0U) & 0xFFU);
+    msg.data[6] = (uint8_t) ((resetreas >> 8U) & 0xFFU);
+    msg.data[7] = (uint8_t) ((resetreas >> 16U) & 0xFFU);
+    msg.data[8] = (uint8_t) ((resetreas >> 24U) & 0xFFU);
+
+    const rd_status_t fatal_error = fatal_valid ? record.error : RD_SUCCESS;
+    msg.data[9] = (uint8_t) ((fatal_error >> 0U) & 0xFFU);
+    msg.data[10] = (uint8_t) ((fatal_error >> 8U) & 0xFFU);
+    msg.data[11] = (uint8_t) ((fatal_error >> 16U) & 0xFFU);
+    msg.data[12] = (uint8_t) ((fatal_error >> 24U) & 0xFFU);
+
+    const uint16_t line = fatal_valid ? (uint16_t) record.line : 0U;
+    msg.data[13] = (uint8_t) ((line >> 0U) & 0xFFU);
+    msg.data[14] = (uint8_t) ((line >> 8U) & 0xFFU);
+
+    const uint16_t file_hash = fatal_valid ? postmortem_filename_hash (record.filename) : 0U;
+    msg.data[15] = (uint8_t) ((file_hash >> 0U) & 0xFFU);
+    msg.data[16] = (uint8_t) ((file_hash >> 8U) & 0xFFU);
+
+    msg.data[17] = (uint8_t) ((load_status >> 0U) & 0xFFU);
+    msg.data[18] = (uint8_t) ((load_status >> 8U) & 0xFFU);
+    msg.data[19] = 0U;
+
+    (void) app_comms_blocking_send (reply_fp, &msg);
+
+    /* Follow the PM header with up to four newest raw-journal entries.
+     * These survive a subsequent FDS init purge/reset. */
+    for (size_t i = 0U; i < 4U; i++)
+    {
+        rt_flash_postmortem_journal_record_t jr = {0};
+        if (RD_SUCCESS != rt_flash_postmortem_journal_load (i, &jr))
+        {
+            break;
+        }
+        ri_comm_message_t jmsg = {0};
+        jmsg.data_length = 20U;
+        jmsg.repeat_count = 1U;
+        jmsg.data[0] = 0x4AU; /* J */
+        jmsg.data[1] = 0x52U; /* R */
+        jmsg.data[2] = 0x01U; /* journal format */
+        jmsg.data[3] = (uint8_t) i;
+        jmsg.data[4] = jr.reset_source;
+        jmsg.data[5] = jr.fatal_valid ? 0x01U : 0U;
+        jmsg.data[6] = (uint8_t) ((jr.sequence >> 0U) & 0xFFU);
+        jmsg.data[7] = (uint8_t) ((jr.sequence >> 8U) & 0xFFU);
+        jmsg.data[8] = (uint8_t) ((jr.sequence >> 16U) & 0xFFU);
+        jmsg.data[9] = (uint8_t) ((jr.sequence >> 24U) & 0xFFU);
+        jmsg.data[10] = (uint8_t) ((jr.error >> 0U) & 0xFFU);
+        jmsg.data[11] = (uint8_t) ((jr.error >> 8U) & 0xFFU);
+        jmsg.data[12] = (uint8_t) ((jr.error >> 16U) & 0xFFU);
+        jmsg.data[13] = (uint8_t) ((jr.error >> 24U) & 0xFFU);
+        const uint16_t jr_line = (uint16_t) jr.line;
+        jmsg.data[14] = (uint8_t) ((jr_line >> 0U) & 0xFFU);
+        jmsg.data[15] = (uint8_t) ((jr_line >> 8U) & 0xFFU);
+        jmsg.data[16] = (uint8_t) ((jr.file_hash >> 0U) & 0xFFU);
+        jmsg.data[17] = (uint8_t) ((jr.file_hash >> 8U) & 0xFFU);
+        jmsg.data[18] = 0U;
+        jmsg.data[19] = 0U;
+        (void) app_comms_blocking_send (reply_fp, &jmsg);
+    }
+}
+
+static bool postmortem_command_handle (const ri_comm_xfer_fp_t reply_fp,
+                                       const uint8_t * const data,
+                                       const size_t data_len)
+{
+    if ((NULL == data) || (POSTMORTEM_CMD_LEN != data_len))
+    {
+        return false;
+    }
+
+    if (0 == memcmp (data, POSTMORTEM_CMD_REPORT, POSTMORTEM_CMD_LEN))
+    {
+        postmortem_report_send (reply_fp);
+        return true;
+    }
+
+    if (0 == memcmp (data, POSTMORTEM_CMD_CLEAR, POSTMORTEM_CMD_LEN))
+    {
+        (void) rt_flash_postmortem_clear_sync();
+        return true;
+    }
+
+    if (0 == memcmp (data, POSTMORTEM_CMD_CRASH, POSTMORTEM_CMD_LEN))
+    {
+        /*
+         * Intentional validation of the exact production fatal path:
+         * rd_error_check() -> app_on_error() -> persistent post-mortem store ->
+         * ri_power_reset().
+         */
+        RD_ERROR_CHECK (RD_ERROR_INVALID_STATE, RD_SUCCESS);
+        return true;
+    }
+
+    if (0 == memcmp (data, POSTMORTEM_CMD_RESET, POSTMORTEM_CMD_LEN))
+    {
+        /* Validate a direct software reset that bypasses app_on_error(). */
+        (void) rt_flash_postmortem_store_reset_sync (RT_RESET_SOURCE_DIAG_DIRECT);
+        ri_power_reset();
+        return true;
+    }
+
+    return false;
 }
 
 TESTABLE_STATIC void handle_comms (const ri_comm_xfer_fp_t reply_fp, void * p_data,
@@ -269,6 +452,10 @@ TESTABLE_STATIC void handle_comms (const ri_comm_xfer_fp_t reply_fp, void * p_da
     if (NULL == p_data)
     {
         err_code |= RD_ERROR_NULL;
+    }
+    else if (postmortem_command_handle (reply_fp, raw_message, data_len))
+    {
+        return;
     }
     else if (data_len < RE_STANDARD_MESSAGE_LENGTH)
     {
@@ -286,6 +473,7 @@ TESTABLE_STATIC void handle_comms (const ri_comm_xfer_fp_t reply_fp, void * p_da
         err_code |= ri_gatt_params_request (RI_GATT_TURBO, CONN_PARAM_UPDATE_DELAY_MS);
         // Parse message type.
         re_type_t type = raw_message[RE_STANDARD_DESTINATION_INDEX];
+        bool disconnect_requested = false;
 
         // Route message to proper handler.
         switch (type)
@@ -306,11 +494,22 @@ TESTABLE_STATIC void handle_comms (const ri_comm_xfer_fp_t reply_fp, void * p_da
                 break;
 
             case RE_SEC_PASS:
-                err_code |= password_check (reply_fp, raw_message);
+                err_code |= password_check (reply_fp, raw_message, &disconnect_requested);
                 break;
 
             default:
                 break;
+        }
+
+        /*
+         * An authenticated password command has requested an asynchronous GAP
+         * disconnect.  Do not touch connection parameters or restart heartbeat
+         * processing on a link that is now being torn down.
+         */
+        if (disconnect_requested)
+        {
+            RD_ERROR_CHECK (err_code, ~RD_ERROR_FATAL);
+            return;
         }
 
         // Switch GATT to slower params.
@@ -383,7 +582,37 @@ TESTABLE_STATIC void on_gatt_connected_isr (void * p_data, size_t data_len)
 TESTABLE_STATIC void handle_gatt_disconnected (void * p_data, uint16_t data_len)
 {
     rd_status_t err_code = RD_SUCCESS;
-    config_cleanup_on_disconnect();
+
+    if (m_config_enable_after_disconnect)
+    {
+        /*
+         * The link is now genuinely down. It is safe to cycle the BLE/GATT
+         * stack and expose the configuration + buttonless DFU services.
+         */
+        m_config_enable_after_disconnect = false;
+        m_config_enabled_on_curr_conn = false;
+        m_mode_ops.disable_config = 1;
+
+        err_code |= enable_config_on_next_conn (true);
+        err_code |= ri_timer_stop (m_comm_timer);
+        err_code |= ri_timer_start (m_comm_timer,
+                                    APP_CONFIG_ENABLED_TIME_MS,
+                                    &m_mode_ops);
+
+        /*
+         * handle_comms() stopped heartbeat processing before the authenticated
+         * password command was handled. In the graceful-disconnect path we
+         * intentionally skip restarting it on the old link, so resume it only
+         * after the real disconnect event has arrived and config-mode GATT has
+         * been rebuilt.
+         */
+        err_code |= app_heartbeat_start();
+    }
+    else
+    {
+        config_cleanup_on_disconnect();
+    }
+
     RD_ERROR_CHECK (err_code, RD_SUCCESS);
 }
 
@@ -599,10 +828,13 @@ static rd_status_t adv_init (void)
     adv_settings.manufacturer_id = RB_BLE_MANUFACTURER_ID;
     err_code |= rt_adv_init (&adv_settings);
     RD_ERROR_CHECK (err_code, ~RD_ERROR_FATAL);
+
     err_code |= ri_adv_type_set (NONCONNECTABLE_NONSCANNABLE);
     RD_ERROR_CHECK (err_code, ~RD_ERROR_FATAL);
+
     app_comms_bleadv_send_count_set (initial_adv_send_count());
     m_mode_ops.switch_to_normal = 1;
+
     err_code |= prepare_mode_change (&m_mode_ops);
     RD_ERROR_CHECK (err_code, ~RD_ERROR_FATAL);
 #endif
@@ -615,6 +847,7 @@ static rd_status_t gatt_init (const ri_comm_dis_init_t * const p_dis, const bool
 #if APP_GATT_ENABLED
     char name[SCAN_RSP_NAME_MAX_LEN + 1] = {0};
     ble_name_string_create (name, sizeof (name));
+
     err_code |= rt_gatt_init (name);
 
     if (!secure)
@@ -623,11 +856,14 @@ static rd_status_t gatt_init (const ri_comm_dis_init_t * const p_dis, const bool
     }
 
     err_code |= rt_gatt_dis_init (p_dis);
+
     err_code |= rt_gatt_nus_init ();
+
     rt_gatt_set_on_connected_isr (&on_gatt_connected_isr);
     rt_gatt_set_on_disconn_isr (&on_gatt_disconnected_isr);
     rt_gatt_set_on_received_isr (&on_gatt_data_isr);
     rt_gatt_set_on_sent_isr (&on_gatt_tx_done_isr);
+
     err_code |= rt_gatt_adv_enable();
 #endif
     return err_code;
@@ -663,10 +899,13 @@ rd_status_t app_comms_ble_init (const bool secure)
 {
     rd_status_t err_code = RD_SUCCESS;
     ri_comm_dis_init_t dis = {0};
+
     err_code |= dis_init (&dis, secure);
     RD_ERROR_CHECK (err_code, ~RD_ERROR_FATAL);
+
     err_code |= adv_init();
     RD_ERROR_CHECK (err_code, ~RD_ERROR_FATAL);
+
     err_code |= gatt_init (&dis, secure);
     RD_ERROR_CHECK (err_code, ~RD_ERROR_FATAL);
     ri_radio_activity_callback_set (&app_sensor_vdd_measure_isr);

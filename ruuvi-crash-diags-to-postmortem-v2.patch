@@ -1,0 +1,735 @@
+diff -ruN ruuvi_crash_diags/ruuvi.firmware.c/POSTMORTEM_DIAG_V2.md ruuvi_postmortem_v2/POSTMORTEM_DIAG_V2.md
+--- ruuvi_crash_diags/ruuvi.firmware.c/POSTMORTEM_DIAG_V2.md	1970-01-01 00:00:00.000000000 +0000
++++ ruuvi_postmortem_v2/POSTMORTEM_DIAG_V2.md	2026-09-06 07:52:00.285618196 +0000
+@@ -0,0 +1,112 @@
++# Ruuvi post-mortem diagnostics v2
++
++Built from the supplied `ruuvi.firmware.c-CRASH-DIAGS.zip` baseline.
++
++## What changed
++
++- `RESETREAS` is captured once at application entry, then those sticky bits are cleared.
++  `DIAG?` reports the captured value for the current boot, so an older reset cannot
++  contaminate a later report.
++- The persistent FDS record now stores a reset source as well as optional fatal
++  `rd_status_t`, source filename and line.
++- Direct reset call sites that can safely persist FDS state are tagged:
++  - `APP_FATAL`
++  - `CART_GESTURE`
++  - `BOOTLOADER_FALLBACK`
++- `RSET!` was added as a validation command for a direct software reset that bypasses
++  `app_on_error()`.
++- Existing `CRASH`, `CLEAR`, and `DIAG?` remain.
++- No diagnostic code uses GPREGRET or GPREGRET2.
++
++Flash-init and Peer Manager failure paths still purge FDS before resetting, so FDS cannot
++reliably preserve a source tag there. A fresh `RESETREAS=SREQ` with no persistent record
++still distinguishes a software reset from watchdog/lockup/pin-reset classes, but those
++storage-failure paths remain possible explanations for `SREQ + source=NONE`.
++
++## Commands
++
++Write these five ASCII bytes to Nordic UART RX (`6E400002...`), with notifications enabled
++on Nordic UART TX (`6E400003...`):
++
++- `DIAG?` - emit one PM v2 report
++- `CLEAR` - delete the persistent post-mortem record
++- `CRASH` - intentional fatal through `RD_ERROR_CHECK -> app_on_error -> reset`
++- `RSET!` - intentional direct reset that bypasses `app_on_error`
++
++## PM v2 packet
++
++Exactly 20 bytes:
++
++```
++50 4D 02 SS FF RR RR RR RR EE EE EE EE LL LL HH HH TT TT 00
++```
++
++- `SS`: reset source
++  - `0`: NONE
++  - `1`: APP_FATAL
++  - `2`: CART_GESTURE
++  - `3`: BOOTLOADER_FALLBACK
++  - `4`: DIAG_DIRECT
++- `FF`: flags
++  - bit 0: persistent record valid
++  - bit 1: fatal data valid
++- `RR`: captured boot `RESETREAS`, uint32 little-endian
++- `EE`: fatal `rd_status_t`, uint32 little-endian
++- `LL`: source line, uint16 little-endian
++- `HH`: 16-bit filename hash
++- `TT`: flash-load status low 16 bits
++
++## Validation
++
++### Fatal path
++
++1. `CLEAR`
++2. send `CRASH`
++3. reconnect after reboot
++4. enable TX notifications
++5. send `DIAG?`
++
++For this exact tree, the expected fatal report is:
++
++```
++50 4D 02 01 03 04 00 00 00 20 00 00 00 8A 01 C2 2C 00 00 00
++```
++
++That decodes to:
++
++- source: `APP_FATAL`
++- record/fatal valid: yes/yes
++- RESETREAS: `0x00000004` (`SREQ`)
++- error: `0x00000020` (`RD_ERROR_INVALID_STATE`)
++- line: `394`
++- file hash: `0x2CC2` (`app_comms.c`)
++
++### Direct-reset path
++
++1. `CLEAR`
++2. send `RSET!`
++3. reconnect
++4. send `DIAG?`
++
++Expected classification:
++
++- source: `DIAG_DIRECT`
++- record valid: yes
++- fatal valid: no
++- RESETREAS: `SREQ`
++
++Use `decode_ruuvi_pmr.py` to decode a raw 20-byte packet.
++
++## Real DFU failure
++
++After a visible unexpected reboot, do not retry DFU first. Reconnect in nRF Connect,
++enable UART TX notifications, and send `DIAG?`.
++
++The important classifications are:
++
++- `SREQ + APP_FATAL + fatal_valid=1`: exact application fatal; use error/file/line.
++- `SREQ + tagged direct source`: explicit reset call site identified.
++- `DOG + source=NONE`: watchdog reset.
++- `LOCKUP + source=NONE`: CPU lockup class.
++- `SREQ + source=NONE`: software reset bypassed the tagged/persisted paths, or FDS was
++  unavailable/purged during the reset path.
+diff -ruN ruuvi_crash_diags/ruuvi.firmware.c/decode_ruuvi_pmr.py ruuvi_postmortem_v2/decode_ruuvi_pmr.py
+--- ruuvi_crash_diags/ruuvi.firmware.c/decode_ruuvi_pmr.py	2026-09-06 13:57:12.000000000 +0000
++++ ruuvi_postmortem_v2/decode_ruuvi_pmr.py	2026-09-06 07:50:57.889026308 +0000
+@@ -20,6 +20,7 @@
+     0x00008000: 'RD_ERROR_RESOURCES',
+     0x00010000: 'RD_ERROR_NOT_IMPLEMENTED',
+     0x00020000: 'RD_ERROR_SELFTEST',
++    0x00040000: 'RD_ERROR_MORE_AVAILABLE',
+     0x00080000: 'RD_ERROR_NOT_INITIALIZED',
+     0x00100000: 'RD_ERROR_NOT_ACKNOWLEDGED',
+     0x00200000: 'RD_ERROR_NOT_ENABLED',
+@@ -27,12 +28,22 @@
+     0x80000000: 'RD_ERROR_FATAL',
+ }
+ 
++SOURCES = {
++    0: 'NONE',
++    1: 'APP_FATAL',
++    2: 'CART_GESTURE',
++    3: 'BOOTLOADER_FALLBACK',
++    4: 'DIAG_DIRECT',
++}
++
++
+ def rd_names(value):
+     if value == 0:
+         return ['RD_SUCCESS']
+     names = [name for bit, name in ERRORS.items() if value & bit]
+     return names or ['unknown']
+ 
++
+ def reset_names(v):
+     bits = {
+         0: 'RESETPIN',
+@@ -47,19 +58,27 @@
+     names = [name for bit, name in bits.items() if v & (1 << bit)]
+     return names or ['none/unknown']
+ 
+-raw = ''.join(sys.argv[1:]).replace('0x','').replace(':','').replace('-','').replace(' ','').replace("'",'')
++
++raw = ''.join(sys.argv[1:]).replace('0x', '').replace(':', '').replace('-', '').replace(' ', '').replace("'", '')
+ b = bytes.fromhex(raw)
+-if len(b) != 20 or b[:3] != b'PM\x01':
+-    raise SystemExit('Expected exactly 20 bytes beginning 50 4D 01')
+-resetreas = int.from_bytes(b[3:7], 'little')
+-error = int.from_bytes(b[7:11], 'little')
+-line = int.from_bytes(b[11:13], 'little')
+-hash_ = int.from_bytes(b[13:15], 'little')
+-valid = b[15]
+-load = int.from_bytes(b[16:20], 'little')
+-print(f'resetreas = 0x{resetreas:08X} ({", ".join(reset_names(resetreas))})')
+-print(f'error     = 0x{error:08X} ({", ".join(rd_names(error))})')
+-print(f'line      = {line}')
+-print(f'file_hash = 0x{hash_:04X}')
+-print(f'valid     = {valid}')
+-print(f'load      = 0x{load:08X} ({", ".join(rd_names(load))})')
++if len(b) != 20 or b[:3] != b'PM\x02':
++    raise SystemExit('Expected exactly 20 bytes beginning 50 4D 02')
++
++source = b[3]
++flags = b[4]
++record_valid = bool(flags & 0x01)
++fatal_valid = bool(flags & 0x02)
++resetreas = int.from_bytes(b[5:9], 'little')
++error = int.from_bytes(b[9:13], 'little')
++line = int.from_bytes(b[13:15], 'little')
++hash_ = int.from_bytes(b[15:17], 'little')
++load = int.from_bytes(b[17:19], 'little')
++
++print(f'source       = {source} ({SOURCES.get(source, "UNKNOWN")})')
++print(f'record_valid = {int(record_valid)}')
++print(f'fatal_valid  = {int(fatal_valid)}')
++print(f'resetreas    = 0x{resetreas:08X} ({", ".join(reset_names(resetreas))})')
++print(f'error        = 0x{error:08X} ({", ".join(rd_names(error))})')
++print(f'line         = {line}')
++print(f'file_hash    = 0x{hash_:04X}')
++print(f'load_low16   = 0x{load:04X} ({", ".join(rd_names(load))})')
+diff -ruN ruuvi_crash_diags/ruuvi.firmware.c/src/app_button.c ruuvi_postmortem_v2/src/app_button.c
+--- ruuvi_crash_diags/ruuvi.firmware.c/src/app_button.c	2026-09-06 04:49:16.000000000 +0000
++++ ruuvi_postmortem_v2/src/app_button.c	2026-09-06 07:48:26.565006626 +0000
+@@ -13,6 +13,7 @@
+ #include "ruuvi_interface_scheduler.h"
+ #include "ruuvi_interface_timer.h"
+ #include "ruuvi_task_button.h"
++#include "ruuvi_task_flash.h"
+ 
+ /**
+  * @addtogroup app_button
+@@ -58,6 +59,7 @@
+     // Execution stops here normally
+     ri_power_enter_bootloader();
+     // Reset on fail to enter BL
++    (void) rt_flash_postmortem_store_reset_sync (RT_RESET_SOURCE_BOOTLOADER_FALLBACK);
+     ri_power_reset();
+ }
+ 
+diff -ruN ruuvi_crash_diags/ruuvi.firmware.c/src/app_cart_motion.c ruuvi_postmortem_v2/src/app_cart_motion.c
+--- ruuvi_crash_diags/ruuvi.firmware.c/src/app_cart_motion.c	2026-09-06 04:49:15.000000000 +0000
++++ ruuvi_postmortem_v2/src/app_cart_motion.c	2026-09-06 07:48:26.564798097 +0000
+@@ -12,6 +12,7 @@
+ #include "app_led.h"
+ #include "ruuvi_boards.h"
+ #include "ruuvi_task_led.h"
++#include "ruuvi_task_flash.h"
+ #include "ruuvi_interface_power.h"
+ #include "ruuvi_interface_rtc.h"
+ #include "ruuvi_interface_scheduler.h"
+@@ -381,6 +382,7 @@
+     if (m_gesture_state == CART_GESTURE_WAIT_IDLE)
+     {
+         cart_gesture_confirm_blink();
++        (void) rt_flash_postmortem_store_reset_sync (RT_RESET_SOURCE_CART_GESTURE);
+         ri_power_reset();
+     }
+ 
+diff -ruN ruuvi_crash_diags/ruuvi.firmware.c/src/app_comms.c ruuvi_postmortem_v2/src/app_comms.c
+--- ruuvi_crash_diags/ruuvi.firmware.c/src/app_comms.c	2026-09-06 07:12:11.000000000 +0000
++++ ruuvi_postmortem_v2/src/app_comms.c	2026-09-06 07:49:07.031262630 +0000
+@@ -4,6 +4,7 @@
+ #include "app_led.h"
+ #include "app_sensor.h"
+ #include "app_testing.h"
++#include "main.h"
+ #include "ruuvi_boards.h"
+ #include "ruuvi_endpoints.h"
+ #include "ruuvi_interface_communication.h"
+@@ -19,7 +20,6 @@
+ #include "ruuvi_task_gatt.h"
+ #include "ruuvi_task_nfc.h"
+ #include "ruuvi_task_flash.h"
+-#include "nrf.h"
+ #include <stdio.h>
+ #include <string.h>
+ 
+@@ -285,6 +285,7 @@
+ #define POSTMORTEM_CMD_REPORT "DIAG?"
+ #define POSTMORTEM_CMD_CRASH  "CRASH"
+ #define POSTMORTEM_CMD_CLEAR  "CLEAR"
++#define POSTMORTEM_CMD_RESET  "RSET!"
+ #define POSTMORTEM_CMD_LEN     (5U)
+ 
+ static uint16_t postmortem_filename_hash (const char * filename)
+@@ -307,54 +308,57 @@
+ }
+ 
+ /*
+- * PM v1 packet, exactly 20 bytes:
++ * PM v2 packet, exactly 20 bytes:
+  *
+- *   50 4D 01 RR RR RR RR EE EE EE EE LL LL HH HH VV SS SS SS SS
+- *   P  M v1 <RESETREAS LE> <fatal error LE> <line LE> <file hash LE>
+- *            <valid> <flash-load status LE>
++ *   50 4D 02 SS FF RR RR RR RR EE EE EE EE LL LL HH HH TT TT 00
++ *   P  M v2 src flg <boot RESETREAS> <fatal error> <line> <file hash>
++ *              <flash-load status low 16 bits> <reserved>
+  *
+- * valid=1 means a persistent fatal record was recovered. RESETREAS is read
+- * directly and is never cleared or modified by this diagnostic.
++ * SS is a persisted rt_reset_source_t.
++ * FF bit 0 = post-mortem record valid, bit 1 = fatal record valid.
++ * RESETREAS is captured at application entry and the sticky hardware bits are
++ * then cleared, so the value belongs to this boot rather than an older reset.
+  */
+ static void postmortem_report_send (const ri_comm_xfer_fp_t reply_fp)
+ {
+-    rt_flash_fatal_record_t record = {0};
+-    const rd_status_t load_status = rt_flash_fatal_load (&record);
+-    const bool valid = (RD_SUCCESS == load_status)
+-                       && (RT_FLASH_FATAL_MAGIC == record.magic);
++    rt_flash_postmortem_record_t record = {0};
++    const rd_status_t load_status = rt_flash_postmortem_load (&record);
++    const bool record_valid = (RD_SUCCESS == load_status)
++                              && (RT_FLASH_POSTMORTEM_MAGIC == record.magic);
++    const bool fatal_valid = record_valid && (0U != record.fatal_valid);
+ 
+     ri_comm_message_t msg = {0};
+     msg.data_length = 20U;
+     msg.repeat_count = 1U;
+     msg.data[0] = 0x50U; /* P */
+     msg.data[1] = 0x4DU; /* M */
+-    msg.data[2] = 0x01U; /* version */
+-
+-    const uint32_t resetreas = NRF_POWER->RESETREAS;
+-    msg.data[3] = (uint8_t) ((resetreas >> 0U) & 0xFFU);
+-    msg.data[4] = (uint8_t) ((resetreas >> 8U) & 0xFFU);
+-    msg.data[5] = (uint8_t) ((resetreas >> 16U) & 0xFFU);
+-    msg.data[6] = (uint8_t) ((resetreas >> 24U) & 0xFFU);
+-
+-    const rd_status_t fatal_error = valid ? record.error : RD_SUCCESS;
+-    msg.data[7] = (uint8_t) ((fatal_error >> 0U) & 0xFFU);
+-    msg.data[8] = (uint8_t) ((fatal_error >> 8U) & 0xFFU);
+-    msg.data[9] = (uint8_t) ((fatal_error >> 16U) & 0xFFU);
+-    msg.data[10] = (uint8_t) ((fatal_error >> 24U) & 0xFFU);
+-
+-    const uint16_t line = valid ? (uint16_t) record.line : 0U;
+-    msg.data[11] = (uint8_t) ((line >> 0U) & 0xFFU);
+-    msg.data[12] = (uint8_t) ((line >> 8U) & 0xFFU);
+-
+-    const uint16_t file_hash = valid ? postmortem_filename_hash (record.filename) : 0U;
+-    msg.data[13] = (uint8_t) ((file_hash >> 0U) & 0xFFU);
+-    msg.data[14] = (uint8_t) ((file_hash >> 8U) & 0xFFU);
+-
+-    msg.data[15] = valid ? 1U : 0U;
+-    msg.data[16] = (uint8_t) ((load_status >> 0U) & 0xFFU);
+-    msg.data[17] = (uint8_t) ((load_status >> 8U) & 0xFFU);
+-    msg.data[18] = (uint8_t) ((load_status >> 16U) & 0xFFU);
+-    msg.data[19] = (uint8_t) ((load_status >> 24U) & 0xFFU);
++    msg.data[2] = 0x02U; /* version */
++    msg.data[3] = record_valid ? record.reset_source : (uint8_t) RT_RESET_SOURCE_NONE;
++    msg.data[4] = (record_valid ? 0x01U : 0U) | (fatal_valid ? 0x02U : 0U);
++
++    const uint32_t resetreas = app_boot_resetreas_get();
++    msg.data[5] = (uint8_t) ((resetreas >> 0U) & 0xFFU);
++    msg.data[6] = (uint8_t) ((resetreas >> 8U) & 0xFFU);
++    msg.data[7] = (uint8_t) ((resetreas >> 16U) & 0xFFU);
++    msg.data[8] = (uint8_t) ((resetreas >> 24U) & 0xFFU);
++
++    const rd_status_t fatal_error = fatal_valid ? record.error : RD_SUCCESS;
++    msg.data[9] = (uint8_t) ((fatal_error >> 0U) & 0xFFU);
++    msg.data[10] = (uint8_t) ((fatal_error >> 8U) & 0xFFU);
++    msg.data[11] = (uint8_t) ((fatal_error >> 16U) & 0xFFU);
++    msg.data[12] = (uint8_t) ((fatal_error >> 24U) & 0xFFU);
++
++    const uint16_t line = fatal_valid ? (uint16_t) record.line : 0U;
++    msg.data[13] = (uint8_t) ((line >> 0U) & 0xFFU);
++    msg.data[14] = (uint8_t) ((line >> 8U) & 0xFFU);
++
++    const uint16_t file_hash = fatal_valid ? postmortem_filename_hash (record.filename) : 0U;
++    msg.data[15] = (uint8_t) ((file_hash >> 0U) & 0xFFU);
++    msg.data[16] = (uint8_t) ((file_hash >> 8U) & 0xFFU);
++
++    msg.data[17] = (uint8_t) ((load_status >> 0U) & 0xFFU);
++    msg.data[18] = (uint8_t) ((load_status >> 8U) & 0xFFU);
++    msg.data[19] = 0U;
+ 
+     (void) app_comms_blocking_send (reply_fp, &msg);
+ }
+@@ -376,7 +380,7 @@
+ 
+     if (0 == memcmp (data, POSTMORTEM_CMD_CLEAR, POSTMORTEM_CMD_LEN))
+     {
+-        (void) rt_flash_fatal_clear_sync();
++        (void) rt_flash_postmortem_clear_sync();
+         return true;
+     }
+ 
+@@ -384,13 +388,21 @@
+     {
+         /*
+          * Intentional validation of the exact production fatal path:
+-         * rd_error_check() -> app_on_error() -> persistent fatal store ->
++         * rd_error_check() -> app_on_error() -> persistent post-mortem store ->
+          * ri_power_reset().
+          */
+         RD_ERROR_CHECK (RD_ERROR_INVALID_STATE, RD_SUCCESS);
+         return true;
+     }
+ 
++    if (0 == memcmp (data, POSTMORTEM_CMD_RESET, POSTMORTEM_CMD_LEN))
++    {
++        /* Validate a direct software reset that bypasses app_on_error(). */
++        (void) rt_flash_postmortem_store_reset_sync (RT_RESET_SOURCE_DIAG_DIRECT);
++        ri_power_reset();
++        return true;
++    }
++
+     return false;
+ }
+ 
+diff -ruN ruuvi_crash_diags/ruuvi.firmware.c/src/main.c ruuvi_postmortem_v2/src/main.c
+--- ruuvi_crash_diags/ruuvi.firmware.c/src/main.c	2026-09-06 13:57:12.000000000 +0000
++++ ruuvi_postmortem_v2/src/main.c	2026-09-06 07:48:25.849185157 +0000
+@@ -32,6 +32,26 @@
+ #include "ruuvi_task_led.h"
+ #include "ruuvi_task_adc.h"
+ 
++#ifndef CEEDLING
++#include "nrf.h"
++#endif
++
++static uint32_t m_boot_resetreas;
++
++uint32_t app_boot_resetreas_get (void)
++{
++    return m_boot_resetreas;
++}
++
++#ifndef CEEDLING
++static void app_boot_resetreas_capture (void)
++{
++    m_boot_resetreas = NRF_POWER->RESETREAS;
++    /* RESETREAS bits are sticky. Writing 1 clears only the captured bits. */
++    NRF_POWER->RESETREAS = m_boot_resetreas;
++}
++#endif
++
+ #if (!RUUVI_RUN_TESTS)
+ #ifndef CEEDLING
+ static
+@@ -57,7 +77,7 @@
+          * software reset. This does not touch GPREGRET, GPREGRET2 or
+          * RESETREAS.
+          */
+-        (void) rt_flash_fatal_store_sync (error, file, line);
++        (void) rt_flash_postmortem_store_fatal_sync (error, file, line);
+         ri_power_reset();
+     }
+ }
+@@ -113,6 +133,9 @@
+ int main (void)
+ #endif
+ {
++#   ifndef CEEDLING
++    app_boot_resetreas_capture();
++#   endif
+ #   if RUUVI_RUN_TESTS
+     integration_tests_run();
+ #   endif
+diff -ruN ruuvi_crash_diags/ruuvi.firmware.c/src/main.h ruuvi_postmortem_v2/src/main.h
+--- ruuvi_crash_diags/ruuvi.firmware.c/src/main.h	2026-09-02 14:46:13.000000000 +0000
++++ ruuvi_postmortem_v2/src/main.h	2026-09-06 07:51:17.566918987 +0000
+@@ -5,6 +5,7 @@
+ #include "ruuvi_interface_gpio_interrupt.h"
+ #include "ruuvi_interface_log.h"
+ #include <stdlib.h>
++#include <stdint.h>
+ #include <stdio.h>
+ 
+ /**
+@@ -29,6 +30,9 @@
+ 
+ #define APP_SELFTEST_OK_DELAY_MS (1000U) //!< time to show "ok" led.
+ 
++/** @brief RESETREAS captured at application entry for the current boot. */
++uint32_t app_boot_resetreas_get (void);
++
+ #ifdef CEEDLING
+ void on_wdt (void);
+ void app_on_error (const rd_status_t error,
+diff -ruN ruuvi_crash_diags/ruuvi.firmware.c/src/ruuvi.drivers.c/src/nrf5_sdk15_platform/communication/ruuvi_nrf5_sdk15_communication_ble_gatt.c ruuvi_postmortem_v2/src/ruuvi.drivers.c/src/nrf5_sdk15_platform/communication/ruuvi_nrf5_sdk15_communication_ble_gatt.c
+--- ruuvi_crash_diags/ruuvi.firmware.c/src/ruuvi.drivers.c/src/nrf5_sdk15_platform/communication/ruuvi_nrf5_sdk15_communication_ble_gatt.c	2026-09-06 04:49:15.000000000 +0000
++++ ruuvi_postmortem_v2/src/ruuvi.drivers.c/src/nrf5_sdk15_platform/communication/ruuvi_nrf5_sdk15_communication_ble_gatt.c	2026-09-06 07:50:57.888879032 +0000
+@@ -577,7 +577,7 @@
+     // Failed because storage cannot be initialized.
+     if (NRF_SUCCESS != err_code)
+     {
+-
++        /* FDS/Peer Manager storage is not trustworthy here. */
+         ri_flash_purge();
+         ri_power_reset();
+     }
+diff -ruN ruuvi_crash_diags/ruuvi.firmware.c/src/ruuvi.drivers.c/src/tasks/ruuvi_task_flash.c ruuvi_postmortem_v2/src/ruuvi.drivers.c/src/tasks/ruuvi_task_flash.c
+--- ruuvi_crash_diags/ruuvi.firmware.c/src/ruuvi.drivers.c/src/tasks/ruuvi_task_flash.c	2026-09-06 13:57:12.000000000 +0000
++++ ruuvi_postmortem_v2/src/ruuvi.drivers.c/src/tasks/ruuvi_task_flash.c	2026-09-06 07:50:57.888564499 +0000
+@@ -8,8 +8,8 @@
+  * @copyright 2019 Ruuvi Innovations Ltd, license BSD-3-Clause.
+  * @date 2019-11-18 provide compile time choice incase no flash is available
+  * This module provides persistent flash storage and a best-effort synchronous
+- * fatal-error record used for post-mortem diagnostics after software reset.
+- * The fatal recorder uses FDS only; it does not use bootloader-retained
++ * post-mortem record used for diagnostics after software reset.
++ * The recorder uses FDS only; it does not use bootloader-retained
+  * registers or modify RESETREAS.
+  */
+ 
+@@ -38,13 +38,13 @@
+ #define LOGHEX(msg, len) ri_log_hex(TASK_FLASH_LOG_LEVEL, msg, len)
+ 
+ 
+-#define RT_FLASH_FATAL_FILE     (0xBFFEU)
+-#define RT_FLASH_FATAL_RECORD   (0xBFFEU)
+-#define RT_FLASH_FATAL_WAIT_MS  (1500U)
++#define RT_FLASH_POSTMORTEM_FILE     (0xBFFEU)
++#define RT_FLASH_POSTMORTEM_RECORD   (0xBFFEU)
++#define RT_FLASH_POSTMORTEM_WAIT_MS  (1500U)
+ 
+-static rt_flash_fatal_record_t m_fatal_record;
++static rt_flash_postmortem_record_t m_postmortem_record;
+ 
+-static rd_status_t fatal_wait_not_busy (const uint32_t timeout_ms)
++static rd_status_t postmortem_wait_not_busy (const uint32_t timeout_ms)
+ {
+     uint32_t elapsed_ms = 0U;
+ 
+@@ -62,47 +62,59 @@
+     return ri_flash_is_busy() ? RD_ERROR_TIMEOUT : RD_SUCCESS;
+ }
+ 
+-rd_status_t rt_flash_fatal_store_sync (const rd_status_t error,
+-                                       const char * const file,
+-                                       const int line)
++static rd_status_t postmortem_store_sync (const rt_reset_source_t source,
++                                            const bool fatal_valid,
++                                            const rd_status_t error,
++                                            const char * const file,
++                                            const int line)
+ {
+-    rd_status_t status = fatal_wait_not_busy (RT_FLASH_FATAL_WAIT_MS);
++    rd_status_t status = postmortem_wait_not_busy (RT_FLASH_POSTMORTEM_WAIT_MS);
+ 
+     if (RD_SUCCESS != status)
+     {
+         return status;
+     }
+ 
+-    memset (&m_fatal_record, 0, sizeof (m_fatal_record));
+-    m_fatal_record.magic = RT_FLASH_FATAL_MAGIC;
+-    m_fatal_record.error = error;
+-    m_fatal_record.line = line;
+-
+-    if (NULL != file)
+-    {
+-        strncpy (m_fatal_record.filename, file,
+-                 sizeof (m_fatal_record.filename) - 1U);
+-        m_fatal_record.filename[sizeof (m_fatal_record.filename) - 1U] = '\0';
+-    }
+-
+-    /*
+-     * Use the lower flash interface directly. The buffer is static and remains
+-     * valid until the asynchronous FDS operation completes.
+-     */
+-    status = ri_flash_record_set (RT_FLASH_FATAL_FILE,
+-                                  RT_FLASH_FATAL_RECORD,
+-                                  sizeof (m_fatal_record),
+-                                  &m_fatal_record);
++    memset (&m_postmortem_record, 0, sizeof (m_postmortem_record));
++    m_postmortem_record.magic = RT_FLASH_POSTMORTEM_MAGIC;
++    m_postmortem_record.reset_source = (uint8_t) source;
++    m_postmortem_record.fatal_valid = fatal_valid ? 1U : 0U;
++    m_postmortem_record.error = fatal_valid ? error : RD_SUCCESS;
++    m_postmortem_record.line = fatal_valid ? line : 0;
++
++    if (fatal_valid && (NULL != file))
++    {
++        strncpy (m_postmortem_record.filename, file,
++                 sizeof (m_postmortem_record.filename) - 1U);
++        m_postmortem_record.filename[sizeof (m_postmortem_record.filename) - 1U] = '\0';
++    }
++
++    status = ri_flash_record_set (RT_FLASH_POSTMORTEM_FILE,
++                                  RT_FLASH_POSTMORTEM_RECORD,
++                                  sizeof (m_postmortem_record),
++                                  &m_postmortem_record);
+ 
+     if (RD_SUCCESS != status)
+     {
+         return status;
+     }
+ 
+-    return fatal_wait_not_busy (RT_FLASH_FATAL_WAIT_MS);
++    return postmortem_wait_not_busy (RT_FLASH_POSTMORTEM_WAIT_MS);
+ }
+ 
+-rd_status_t rt_flash_fatal_load (rt_flash_fatal_record_t * const p_record)
++rd_status_t rt_flash_postmortem_store_reset_sync (const rt_reset_source_t source)
++{
++    return postmortem_store_sync (source, false, RD_SUCCESS, NULL, 0);
++}
++
++rd_status_t rt_flash_postmortem_store_fatal_sync (const rd_status_t error,
++                                                   const char * const file,
++                                                   const int line)
++{
++    return postmortem_store_sync (RT_RESET_SOURCE_APP_FATAL, true, error, file, line);
++}
++
++rd_status_t rt_flash_postmortem_load (rt_flash_postmortem_record_t * const p_record)
+ {
+     if (NULL == p_record)
+     {
+@@ -110,23 +122,23 @@
+     }
+ 
+     memset (p_record, 0, sizeof (*p_record));
+-    return ri_flash_record_get (RT_FLASH_FATAL_FILE,
+-                                RT_FLASH_FATAL_RECORD,
++    return ri_flash_record_get (RT_FLASH_POSTMORTEM_FILE,
++                                RT_FLASH_POSTMORTEM_RECORD,
+                                 sizeof (*p_record),
+                                 p_record);
+ }
+ 
+-rd_status_t rt_flash_fatal_clear_sync (void)
++rd_status_t rt_flash_postmortem_clear_sync (void)
+ {
+-    rd_status_t status = fatal_wait_not_busy (RT_FLASH_FATAL_WAIT_MS);
++    rd_status_t status = postmortem_wait_not_busy (RT_FLASH_POSTMORTEM_WAIT_MS);
+ 
+     if (RD_SUCCESS != status)
+     {
+         return status;
+     }
+ 
+-    status = ri_flash_record_delete (RT_FLASH_FATAL_FILE,
+-                                     RT_FLASH_FATAL_RECORD);
++    status = ri_flash_record_delete (RT_FLASH_POSTMORTEM_FILE,
++                                     RT_FLASH_POSTMORTEM_RECORD);
+ 
+     if ((RD_SUCCESS != status) && (RD_ERROR_NOT_FOUND != status))
+     {
+@@ -138,7 +150,7 @@
+         return RD_SUCCESS;
+     }
+ 
+-    return fatal_wait_not_busy (RT_FLASH_FATAL_WAIT_MS);
++    return postmortem_wait_not_busy (RT_FLASH_POSTMORTEM_WAIT_MS);
+ }
+ 
+ rd_status_t rt_flash_init (void)
+@@ -149,6 +161,7 @@
+     // Error on flash? purge, reboot
+     if (RD_SUCCESS != err_code)
+     {
++        /* FDS is not trustworthy here; RESETREAS will still identify SREQ. */
+         ri_flash_purge();
+         ri_power_reset();
+         // Stop test execution here.
+@@ -209,9 +222,15 @@
+ #include "ruuvi_driver_error.h"
+ #include <stdlib.h>
+ 
+-rd_status_t rt_flash_fatal_store_sync (const rd_status_t error,
+-                                       const char * const file,
+-                                       const int line)
++rd_status_t rt_flash_postmortem_store_reset_sync (const rt_reset_source_t source)
++{
++    (void) source;
++    return RD_ERROR_NOT_ENABLED;
++}
++
++rd_status_t rt_flash_postmortem_store_fatal_sync (const rd_status_t error,
++                                                   const char * const file,
++                                                   const int line)
+ {
+     (void) error;
+     (void) file;
+@@ -219,13 +238,13 @@
+     return RD_ERROR_NOT_ENABLED;
+ }
+ 
+-rd_status_t rt_flash_fatal_load (rt_flash_fatal_record_t * const p_record)
++rd_status_t rt_flash_postmortem_load (rt_flash_postmortem_record_t * const p_record)
+ {
+     (void) p_record;
+     return RD_ERROR_NOT_ENABLED;
+ }
+ 
+-rd_status_t rt_flash_fatal_clear_sync (void)
++rd_status_t rt_flash_postmortem_clear_sync (void)
+ {
+     return RD_ERROR_NOT_ENABLED;
+ }
+diff -ruN ruuvi_crash_diags/ruuvi.firmware.c/src/ruuvi.drivers.c/src/tasks/ruuvi_task_flash.h ruuvi_postmortem_v2/src/ruuvi.drivers.c/src/tasks/ruuvi_task_flash.h
+--- ruuvi_crash_diags/ruuvi.firmware.c/src/ruuvi.drivers.c/src/tasks/ruuvi_task_flash.h	2026-09-06 13:57:12.000000000 +0000
++++ ruuvi_postmortem_v2/src/ruuvi.drivers.c/src/tasks/ruuvi_task_flash.h	2026-09-06 07:50:57.888169220 +0000
+@@ -48,34 +48,47 @@
+ #include "ruuvi_interface_flash.h"
+ #include "ruuvi_interface_log.h"
+ 
+-#define RT_FLASH_FATAL_MAGIC (0x504D4631UL) /* "PMF1" */
+-#define RT_FLASH_FATAL_FILENAME_LEN (48U)
++#define RT_FLASH_POSTMORTEM_MAGIC (0x504D5232UL) /* "PMR2" */
++#define RT_FLASH_POSTMORTEM_FILENAME_LEN (48U)
++
++typedef enum
++{
++    RT_RESET_SOURCE_NONE = 0,
++    RT_RESET_SOURCE_APP_FATAL = 1,
++    RT_RESET_SOURCE_CART_GESTURE = 2,
++    RT_RESET_SOURCE_BOOTLOADER_FALLBACK = 3,
++    RT_RESET_SOURCE_DIAG_DIRECT = 4
++} rt_reset_source_t;
+ 
+ typedef struct
+ {
+     uint32_t magic;
++    uint8_t reset_source;
++    uint8_t fatal_valid;
++    uint16_t reserved;
+     rd_status_t error;
+     int32_t line;
+-    char filename[RT_FLASH_FATAL_FILENAME_LEN];
+-} rt_flash_fatal_record_t;
++    char filename[RT_FLASH_POSTMORTEM_FILENAME_LEN];
++} rt_flash_postmortem_record_t;
+ 
+ /**
+- * @brief Persist a fatal error synchronously enough to survive a software reset.
++ * @brief Persist a post-mortem record before an intentional software reset.
+  *
+- * Intended for the application's fatal error callback. The function waits for
+- * an already queued FDS operation to finish, queues the fatal record, then waits
+- * for that operation to complete. It never modifies bootloader retained
+- * registers or RESETREAS.
++ * Best-effort FDS storage only. This never touches GPREGRET, GPREGRET2 or
++ * RESETREAS. For fatal errors, use rt_flash_postmortem_store_fatal_sync().
+  */
+-rd_status_t rt_flash_fatal_store_sync (const rd_status_t error,
+-                                       const char * const file,
+-                                       const int line);
++rd_status_t rt_flash_postmortem_store_reset_sync (const rt_reset_source_t source);
++
++/** @brief Persist a fatal error, source file and line before software reset. */
++rd_status_t rt_flash_postmortem_store_fatal_sync (const rd_status_t error,
++                                                   const char * const file,
++                                                   const int line);
+ 
+-/** @brief Load the most recently persisted fatal error record. */
+-rd_status_t rt_flash_fatal_load (rt_flash_fatal_record_t * const p_record);
++/** @brief Load the most recently persisted post-mortem record. */
++rd_status_t rt_flash_postmortem_load (rt_flash_postmortem_record_t * const p_record);
+ 
+-/** @brief Delete the persisted fatal error record and wait for completion. */
+-rd_status_t rt_flash_fatal_clear_sync (void);
++/** @brief Delete the persisted post-mortem record and wait for completion. */
++rd_status_t rt_flash_postmortem_clear_sync (void);
+ 
+ /**
+  * @brief Initialize flash storage.

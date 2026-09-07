@@ -13,6 +13,7 @@
 #include "ruuvi_interface_scheduler.h"
 #include "ruuvi_interface_timer.h"
 #include "ruuvi_task_button.h"
+#include "ruuvi_task_flash.h"
 
 /**
  * @addtogroup app_button
@@ -58,6 +59,7 @@ void factory_reset (void * p_event_data, uint16_t event_size)
     // Execution stops here normally
     ri_power_enter_bootloader();
     // Reset on fail to enter BL
+    (void) rt_flash_postmortem_store_reset_sync (RT_RESET_SOURCE_BOOTLOADER_FALLBACK);
     ri_power_reset();
 }
 

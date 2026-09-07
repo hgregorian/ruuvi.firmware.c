@@ -1,0 +1,582 @@
+diff -ruN '--exclude=current5-to-auth-tx-diag-v1.patch' /mnt/data/ruuvi_current6/ruuvi.firmware.c/src/app_comms.c /mnt/data/ruuvi_postmortem_diag/src/app_comms.c
+--- /mnt/data/ruuvi_current6/ruuvi.firmware.c/src/app_comms.c	2026-09-06 06:13:48.000000000 +0000
++++ /mnt/data/ruuvi_postmortem_diag/src/app_comms.c	2026-09-06 06:52:02.632608553 +0000
+@@ -18,6 +18,8 @@
+ #include "ruuvi_task_communication.h"
+ #include "ruuvi_task_gatt.h"
+ #include "ruuvi_task_nfc.h"
++#include "ruuvi_task_flash.h"
++#include "nrf.h"
+ #include <stdio.h>
+ #include <string.h>
+ 
+@@ -209,88 +211,6 @@
+     return err_code;
+ }
+ 
+-/*
+- * Live diagnostic for the authentication TX path.  This deliberately runs
+- * only after the original authentication wait has completed, so it cannot
+- * change the result we are trying to measure.  Diagnostic send/wait errors
+- * are ignored and never feed the production error path.
+- *
+- * Packet ATX v1 (12 bytes):
+- *   41 54 58 01 RR RR RR RR WW WW WW WW
+- *   A  T  X  v1 <reply status LE> <wait status LE>
+- */
+-static void auth_tx_diag_send (const ri_comm_xfer_fp_t reply_fp,
+-                               const rd_status_t reply_status,
+-                               const rd_status_t wait_status)
+-{
+-    ri_comm_message_t msg = {0};
+-    msg.data_length = 12U;
+-    msg.repeat_count = 1U;
+-    msg.data[0] = 0x41U; /* A */
+-    msg.data[1] = 0x54U; /* T */
+-    msg.data[2] = 0x58U; /* X */
+-    msg.data[3] = 0x01U; /* version */
+-    msg.data[4] = (uint8_t) ((reply_status >> 0U) & 0xFFU);
+-    msg.data[5] = (uint8_t) ((reply_status >> 8U) & 0xFFU);
+-    msg.data[6] = (uint8_t) ((reply_status >> 16U) & 0xFFU);
+-    msg.data[7] = (uint8_t) ((reply_status >> 24U) & 0xFFU);
+-    msg.data[8] = (uint8_t) ((wait_status >> 0U) & 0xFFU);
+-    msg.data[9] = (uint8_t) ((wait_status >> 8U) & 0xFFU);
+-    msg.data[10] = (uint8_t) ((wait_status >> 16U) & 0xFFU);
+-    msg.data[11] = (uint8_t) ((wait_status >> 24U) & 0xFFU);
+-
+-    m_tx_done = false;
+-    const rd_status_t diag_send_status = reply_fp (&msg);
+-
+-    if (RD_SUCCESS == diag_send_status)
+-    {
+-        /*
+-         * Give the diagnostic notification the same bounded opportunity to
+-         * reach the central.  This happens after wait_status was captured.
+-         * Its result is intentionally discarded.
+-         */
+-        (void) wait_for_tx_done (BLOCKING_COMM_TIMEOUT_MS);
+-    }
+-}
+-
+-/*
+- * If the GAP disconnect request itself fails, report that status while the
+- * original link should still be available.  No packet is sent for RD_SUCCESS
+- * to avoid adding another notification to the normal transition.
+- *
+- * Packet ADE v1 (8 bytes):
+- *   41 44 45 01 DD DD DD DD
+- *   A  D  E  v1 <disconnect status LE>
+- */
+-static void auth_disconnect_error_diag_send (const ri_comm_xfer_fp_t reply_fp,
+-                                             const rd_status_t disconnect_status)
+-{
+-    if (RD_SUCCESS == disconnect_status)
+-    {
+-        return;
+-    }
+-
+-    ri_comm_message_t msg = {0};
+-    msg.data_length = 8U;
+-    msg.repeat_count = 1U;
+-    msg.data[0] = 0x41U; /* A */
+-    msg.data[1] = 0x44U; /* D */
+-    msg.data[2] = 0x45U; /* E */
+-    msg.data[3] = 0x01U; /* version */
+-    msg.data[4] = (uint8_t) ((disconnect_status >> 0U) & 0xFFU);
+-    msg.data[5] = (uint8_t) ((disconnect_status >> 8U) & 0xFFU);
+-    msg.data[6] = (uint8_t) ((disconnect_status >> 16U) & 0xFFU);
+-    msg.data[7] = (uint8_t) ((disconnect_status >> 24U) & 0xFFU);
+-
+-    m_tx_done = false;
+-    const rd_status_t diag_send_status = reply_fp (&msg);
+-
+-    if (RD_SUCCESS == diag_send_status)
+-    {
+-        (void) wait_for_tx_done (BLOCKING_COMM_TIMEOUT_MS);
+-    }
+-}
+-
+ static rd_status_t password_check (const ri_comm_xfer_fp_t reply_fp,
+                                    const uint8_t * const raw_message,
+                                    bool * const p_disconnect_requested)
+@@ -335,19 +255,11 @@
+         auth_ok = false;
+     }
+ 
+-    const rd_status_t wait_status = wait_for_tx_done (BLOCKING_COMM_TIMEOUT_MS);
+-    err_code |= wait_status;
++    err_code |= wait_for_tx_done (BLOCKING_COMM_TIMEOUT_MS);
+ 
+     if (auth_ok)
+     {
+         /*
+-         * Capture the two statuses that precede the config transition while
+-         * the old NUS link is still available.  This diagnostic runs only
+-         * after the original wait has finished, and its own errors are ignored.
+-         */
+-        auth_tx_diag_send (reply_fp, reply_status, wait_status);
+-
+-        /*
+          * Do not tear down the SoftDevice underneath the live connection.
+          * Request a normal GAP disconnect first. handle_gatt_disconnected()
+          * will rebuild GATT in configuration mode after the disconnect event.
+@@ -360,10 +272,6 @@
+         {
+             *p_disconnect_requested = true;
+         }
+-        else
+-        {
+-            auth_disconnect_error_diag_send (reply_fp, disconnect_status);
+-        }
+     }
+     else
+     {
+@@ -373,6 +281,119 @@
+     return  err_code;
+ }
+ 
++
++#define POSTMORTEM_CMD_REPORT "DIAG?"
++#define POSTMORTEM_CMD_CRASH  "CRASH"
++#define POSTMORTEM_CMD_CLEAR  "CLEAR"
++#define POSTMORTEM_CMD_LEN     (5U)
++
++static uint16_t postmortem_filename_hash (const char * filename)
++{
++    uint16_t hash = 0x811CU;
++
++    if (NULL == filename)
++    {
++        return 0U;
++    }
++
++    while ('\0' != *filename)
++    {
++        hash ^= (uint8_t) *filename;
++        hash = (uint16_t) (hash * 0x0193U);
++        filename++;
++    }
++
++    return hash;
++}
++
++/*
++ * PM v1 packet, exactly 20 bytes:
++ *
++ *   50 4D 01 RR RR RR RR EE EE EE EE LL LL HH HH VV SS SS SS SS
++ *   P  M v1 <RESETREAS LE> <fatal error LE> <line LE> <file hash LE>
++ *            <valid> <flash-load status LE>
++ *
++ * valid=1 means a persistent fatal record was recovered. RESETREAS is read
++ * directly and is never cleared or modified by this diagnostic.
++ */
++static void postmortem_report_send (const ri_comm_xfer_fp_t reply_fp)
++{
++    rt_flash_fatal_record_t record = {0};
++    const rd_status_t load_status = rt_flash_fatal_load (&record);
++    const bool valid = (RD_SUCCESS == load_status)
++                       && (RT_FLASH_FATAL_MAGIC == record.magic);
++
++    ri_comm_message_t msg = {0};
++    msg.data_length = 20U;
++    msg.repeat_count = 1U;
++    msg.data[0] = 0x50U; /* P */
++    msg.data[1] = 0x4DU; /* M */
++    msg.data[2] = 0x01U; /* version */
++
++    const uint32_t resetreas = NRF_POWER->RESETREAS;
++    msg.data[3] = (uint8_t) ((resetreas >> 0U) & 0xFFU);
++    msg.data[4] = (uint8_t) ((resetreas >> 8U) & 0xFFU);
++    msg.data[5] = (uint8_t) ((resetreas >> 16U) & 0xFFU);
++    msg.data[6] = (uint8_t) ((resetreas >> 24U) & 0xFFU);
++
++    const rd_status_t fatal_error = valid ? record.error : RD_SUCCESS;
++    msg.data[7] = (uint8_t) ((fatal_error >> 0U) & 0xFFU);
++    msg.data[8] = (uint8_t) ((fatal_error >> 8U) & 0xFFU);
++    msg.data[9] = (uint8_t) ((fatal_error >> 16U) & 0xFFU);
++    msg.data[10] = (uint8_t) ((fatal_error >> 24U) & 0xFFU);
++
++    const uint16_t line = valid ? (uint16_t) record.line : 0U;
++    msg.data[11] = (uint8_t) ((line >> 0U) & 0xFFU);
++    msg.data[12] = (uint8_t) ((line >> 8U) & 0xFFU);
++
++    const uint16_t file_hash = valid ? postmortem_filename_hash (record.filename) : 0U;
++    msg.data[13] = (uint8_t) ((file_hash >> 0U) & 0xFFU);
++    msg.data[14] = (uint8_t) ((file_hash >> 8U) & 0xFFU);
++
++    msg.data[15] = valid ? 1U : 0U;
++    msg.data[16] = (uint8_t) ((load_status >> 0U) & 0xFFU);
++    msg.data[17] = (uint8_t) ((load_status >> 8U) & 0xFFU);
++    msg.data[18] = (uint8_t) ((load_status >> 16U) & 0xFFU);
++    msg.data[19] = (uint8_t) ((load_status >> 24U) & 0xFFU);
++
++    (void) reply_fp (&msg);
++}
++
++static bool postmortem_command_handle (const ri_comm_xfer_fp_t reply_fp,
++                                       const uint8_t * const data,
++                                       const size_t data_len)
++{
++    if ((NULL == data) || (POSTMORTEM_CMD_LEN != data_len))
++    {
++        return false;
++    }
++
++    if (0 == memcmp (data, POSTMORTEM_CMD_REPORT, POSTMORTEM_CMD_LEN))
++    {
++        postmortem_report_send (reply_fp);
++        return true;
++    }
++
++    if (0 == memcmp (data, POSTMORTEM_CMD_CLEAR, POSTMORTEM_CMD_LEN))
++    {
++        (void) rt_flash_fatal_clear_sync();
++        return true;
++    }
++
++    if (0 == memcmp (data, POSTMORTEM_CMD_CRASH, POSTMORTEM_CMD_LEN))
++    {
++        /*
++         * Intentional validation of the exact production fatal path:
++         * rd_error_check() -> app_on_error() -> persistent fatal store ->
++         * ri_power_reset().
++         */
++        RD_ERROR_CHECK (RD_ERROR_INVALID_STATE, RD_SUCCESS);
++        return true;
++    }
++
++    return false;
++}
++
+ TESTABLE_STATIC void handle_comms (const ri_comm_xfer_fp_t reply_fp, void * p_data,
+                                    size_t data_len)
+ {
+@@ -383,6 +404,10 @@
+     {
+         err_code |= RD_ERROR_NULL;
+     }
++    else if (postmortem_command_handle (reply_fp, raw_message, data_len))
++    {
++        return;
++    }
+     else if (data_len < RE_STANDARD_MESSAGE_LENGTH)
+     {
+         err_code |= RD_ERROR_INVALID_PARAM;
+diff -ruN '--exclude=current5-to-auth-tx-diag-v1.patch' /mnt/data/ruuvi_current6/ruuvi.firmware.c/src/main.c /mnt/data/ruuvi_postmortem_diag/src/main.c
+--- /mnt/data/ruuvi_current6/ruuvi.firmware.c/src/main.c	2026-09-06 06:13:48.000000000 +0000
++++ /mnt/data/ruuvi_postmortem_diag/src/main.c	2026-09-06 06:50:37.958792327 +0000
+@@ -50,12 +50,14 @@
+                    const char * file,
+                    const int line)
+ {
+-    (void) error;
+-    (void) file;
+-    (void) line;
+-
+     if (fatal)
+     {
++        /*
++         * Best-effort persistent post-mortem capture before the normal
++         * software reset. This does not touch GPREGRET, GPREGRET2 or
++         * RESETREAS.
++         */
++        (void) rt_flash_fatal_store_sync (error, file, line);
+         ri_power_reset();
+     }
+ }
+diff -ruN '--exclude=current5-to-auth-tx-diag-v1.patch' /mnt/data/ruuvi_current6/ruuvi.firmware.c/src/ruuvi.drivers.c/src/tasks/ruuvi_task_flash.c /mnt/data/ruuvi_postmortem_diag/src/ruuvi.drivers.c/src/tasks/ruuvi_task_flash.c
+--- /mnt/data/ruuvi_current6/ruuvi.firmware.c/src/ruuvi.drivers.c/src/tasks/ruuvi_task_flash.c	2026-09-06 06:13:48.000000000 +0000
++++ /mnt/data/ruuvi_postmortem_diag/src/ruuvi.drivers.c/src/tasks/ruuvi_task_flash.c	2026-09-06 06:52:02.632289524 +0000
+@@ -7,16 +7,10 @@
+  * @author Otso Jousimaa <otso@ojousima.net>
+  * @copyright 2019 Ruuvi Innovations Ltd, license BSD-3-Clause.
+  * @date 2019-11-18 provide compile time choice incase no flash is available
+- * This module has 2 sets of code:
+- *  If flash is enabled:
+- *    on_error: In the event of a fatal error, the error, source file and line number are stored in an error file in flash.
+- *              Then calls the bootloader, failing that reset.
+- *    task_flash_init: calls print_error_cause which retrieves error file from flash and logs it(requires nRF52 DK board).
+- *              Then sets up on_error as the call back error handler.
+- *  If no flash:
+- *    on_error: In the event of a fatal error calls the bootloader, failing that reset.
+- *    task_flash_init: sets up on_error as the call back error handler.
+- * These are in addition to flash utility functions of load, free, is busy and gc_run(which yields until not busy)
++ * This module provides persistent flash storage and a best-effort synchronous
++ * fatal-error record used for post-mortem diagnostics after software reset.
++ * The fatal recorder uses FDS only; it does not use bootloader-retained
++ * registers or modify RESETREAS.
+  */
+ 
+ #include "ruuvi_driver_enabled_modules.h"
+@@ -38,85 +32,113 @@
+ #define TASK_FLASH_LOG_LEVEL RI_LOG_LEVEL_INFO
+ #endif
+ 
+-#ifndef RT_FLASH_ERROR_FILE
+-#  define RT_FLASH_ERROR_FILE 0xBFFE
+-#endif
+-
+-#ifndef RT_FLASH_ERROR_RECORD
+-#  define RT_FLASH_ERROR_RECORD 0xBFFE
+-#endif
+-
+ #define LOG(msg) ri_log(TASK_FLASH_LOG_LEVEL, msg)
+ #define LOGD(msg) ri_log(RI_LOG_DEBUG, msg)
+ #define LOGW(msg) ri_log(RI_LOG_WARNING, msg)
+ #define LOGHEX(msg, len) ri_log_hex(TASK_FLASH_LOG_LEVEL, msg, len)
+ 
+-typedef struct
++
++#define RT_FLASH_FATAL_FILE     (0xBFFEU)
++#define RT_FLASH_FATAL_RECORD   (0xBFFEU)
++#define RT_FLASH_FATAL_WAIT_MS  (1500U)
++
++static rt_flash_fatal_record_t m_fatal_record;
++
++static rd_status_t fatal_wait_not_busy (const uint32_t timeout_ms)
+ {
+-    rd_status_t error;
+-    char filename[32];
+-    int line;
+-} rt_flash_error_cause_t;
+-
+-#if 0
+-static void on_error (const rd_status_t err,
+-                      const bool fatal,
+-                      const char * file,
+-                      const int line)
+-{
+-    if (!fatal)
+-    {
+-        return;
+-    }
+-
+-    error_cause_t error = {.error = err, .line = line };
+-    rd_status_t err_code;
+-    uint32_t timeout = 0;
+-    strncpy (error.filename, file, sizeof (error.filename));
+-    // Store reason of fatal error
+-    err_code = rt_flash_store (APPLICATION_FLASH_ERROR_FILE,
+-                               APPLICATION_FLASH_ERROR_RECORD,
+-                               &error, sizeof (error));
+-
+-    // Wait for flash store op to complete
+-    while (RD_SUCCESS == err_code &&
+-            timeout < 1000 &&
+-            ri_flash_is_busy())
+-    {
+-        timeout++;
+-        // Use microsecond wait to busyloop instead of millisecond wait to low-power sleep
+-        // as low-power sleep may hang on interrupt context.
+-        ri_delay_us (1000);
+-    }
+-
+-    // Try to enter bootloader, if that fails reset.
+-    ri_power_enter_bootloader();
+-    ri_power_reset();
++    uint32_t elapsed_ms = 0U;
++
++    while (ri_flash_is_busy() && (elapsed_ms < timeout_ms))
++    {
++        /*
++         * Busy-wait rather than entering low-power sleep. FDS completion is
++         * driven by SoftDevice/system events and the lower flash callback
++         * clears the busy flag.
++         */
++        ri_delay_us (1000U);
++        elapsed_ms++;
++    }
++
++    return ri_flash_is_busy() ? RD_ERROR_TIMEOUT : RD_SUCCESS;
+ }
+-#endif
+ 
+-#ifndef CEEDLING
+-static
+-#endif
+-void print_error_cause (void)
++rd_status_t rt_flash_fatal_store_sync (const rd_status_t error,
++                                       const char * const file,
++                                       const int line)
++{
++    rd_status_t status = fatal_wait_not_busy (RT_FLASH_FATAL_WAIT_MS);
++
++    if (RD_SUCCESS != status)
++    {
++        return status;
++    }
++
++    memset (&m_fatal_record, 0, sizeof (m_fatal_record));
++    m_fatal_record.magic = RT_FLASH_FATAL_MAGIC;
++    m_fatal_record.error = error;
++    m_fatal_record.line = line;
++
++    if (NULL != file)
++    {
++        strncpy (m_fatal_record.filename, file,
++                 sizeof (m_fatal_record.filename) - 1U);
++        m_fatal_record.filename[sizeof (m_fatal_record.filename) - 1U] = '\0';
++    }
++
++    /*
++     * Use the lower flash interface directly. The buffer is static and remains
++     * valid until the asynchronous FDS operation completes.
++     */
++    status = ri_flash_record_set (RT_FLASH_FATAL_FILE,
++                                  RT_FLASH_FATAL_RECORD,
++                                  sizeof (m_fatal_record),
++                                  &m_fatal_record);
++
++    if (RD_SUCCESS != status)
++    {
++        return status;
++    }
++
++    return fatal_wait_not_busy (RT_FLASH_FATAL_WAIT_MS);
++}
++
++rd_status_t rt_flash_fatal_load (rt_flash_fatal_record_t * const p_record)
+ {
+-    rt_flash_error_cause_t error;
+-    rd_status_t err_code;
+-    err_code = rt_flash_load (RT_FLASH_ERROR_FILE,
+-                              RT_FLASH_ERROR_RECORD,
+-                              &error, sizeof (error));
+-
+-    if (RD_SUCCESS == err_code)
+-    {
+-        char error_str[128];
+-        size_t index = 0;
+-        index += snprintf (error_str, sizeof (error_str), "Previous fatal error: %s:%d: ",
+-                           error.filename, error.line);
+-        index += ri_error_to_string (error.error, error_str + index,
+-                                     sizeof (error_str) - index);
+-        snprintf (error_str + index,  sizeof (error_str) - index, "\r\n");
+-        LOG (error_str);
++    if (NULL == p_record)
++    {
++        return RD_ERROR_NULL;
+     }
++
++    memset (p_record, 0, sizeof (*p_record));
++    return ri_flash_record_get (RT_FLASH_FATAL_FILE,
++                                RT_FLASH_FATAL_RECORD,
++                                sizeof (*p_record),
++                                p_record);
++}
++
++rd_status_t rt_flash_fatal_clear_sync (void)
++{
++    rd_status_t status = fatal_wait_not_busy (RT_FLASH_FATAL_WAIT_MS);
++
++    if (RD_SUCCESS != status)
++    {
++        return status;
++    }
++
++    status = ri_flash_record_delete (RT_FLASH_FATAL_FILE,
++                                     RT_FLASH_FATAL_RECORD);
++
++    if ((RD_SUCCESS != status) && (RD_ERROR_NOT_FOUND != status))
++    {
++        return status;
++    }
++
++    if (RD_ERROR_NOT_FOUND == status)
++    {
++        return RD_SUCCESS;
++    }
++
++    return fatal_wait_not_busy (RT_FLASH_FATAL_WAIT_MS);
+ }
+ 
+ rd_status_t rt_flash_init (void)
+@@ -135,8 +157,6 @@
+ #       endif
+     }
+ 
+-    // Print previous fatal error
+-    print_error_cause();
+     return err_code;
+ }
+ 
+@@ -188,6 +208,28 @@
+ 
+ #include "ruuvi_driver_error.h"
+ #include <stdlib.h>
++
++rd_status_t rt_flash_fatal_store_sync (const rd_status_t error,
++                                       const char * const file,
++                                       const int line)
++{
++    (void) error;
++    (void) file;
++    (void) line;
++    return RD_ERROR_NOT_ENABLED;
++}
++
++rd_status_t rt_flash_fatal_load (rt_flash_fatal_record_t * const p_record)
++{
++    (void) p_record;
++    return RD_ERROR_NOT_ENABLED;
++}
++
++rd_status_t rt_flash_fatal_clear_sync (void)
++{
++    return RD_ERROR_NOT_ENABLED;
++}
++
+ rd_status_t rt_flash_init (void)
+ {
+     // Setup error reset
+diff -ruN '--exclude=current5-to-auth-tx-diag-v1.patch' /mnt/data/ruuvi_current6/ruuvi.firmware.c/src/ruuvi.drivers.c/src/tasks/ruuvi_task_flash.h /mnt/data/ruuvi_postmortem_diag/src/ruuvi.drivers.c/src/tasks/ruuvi_task_flash.h
+--- /mnt/data/ruuvi_current6/ruuvi.firmware.c/src/ruuvi.drivers.c/src/tasks/ruuvi_task_flash.h	2026-09-06 06:13:48.000000000 +0000
++++ /mnt/data/ruuvi_postmortem_diag/src/ruuvi.drivers.c/src/tasks/ruuvi_task_flash.h	2026-09-06 06:52:02.631508245 +0000
+@@ -48,6 +48,35 @@
+ #include "ruuvi_interface_flash.h"
+ #include "ruuvi_interface_log.h"
+ 
++#define RT_FLASH_FATAL_MAGIC (0x504D4631UL) /* "PMF1" */
++#define RT_FLASH_FATAL_FILENAME_LEN (48U)
++
++typedef struct
++{
++    uint32_t magic;
++    rd_status_t error;
++    int32_t line;
++    char filename[RT_FLASH_FATAL_FILENAME_LEN];
++} rt_flash_fatal_record_t;
++
++/**
++ * @brief Persist a fatal error synchronously enough to survive a software reset.
++ *
++ * Intended for the application's fatal error callback. The function waits for
++ * an already queued FDS operation to finish, queues the fatal record, then waits
++ * for that operation to complete. It never modifies bootloader retained
++ * registers or RESETREAS.
++ */
++rd_status_t rt_flash_fatal_store_sync (const rd_status_t error,
++                                       const char * const file,
++                                       const int line);
++
++/** @brief Load the most recently persisted fatal error record. */
++rd_status_t rt_flash_fatal_load (rt_flash_fatal_record_t * const p_record);
++
++/** @brief Delete the persisted fatal error record and wait for completion. */
++rd_status_t rt_flash_fatal_clear_sync (void);
++
+ /**
+  * @brief Initialize flash storage.
+  *
+@@ -162,11 +191,6 @@
+  */
+ bool rt_flash_busy (void);
+ 
+-#ifdef CEEDLING
+-// Give Ceedling access to internal functions.
+-void print_error_cause (void);
+-#endif
+-
+ 
+ /** @} */
+ #endif

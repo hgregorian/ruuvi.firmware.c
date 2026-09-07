@@ -5,6 +5,7 @@
 #include "ruuvi_interface_gpio_interrupt.h"
 #include "ruuvi_interface_log.h"
 #include <stdlib.h>
+#include <stdint.h>
 #include <stdio.h>
 
 /**
@@ -28,6 +29,9 @@
 #define RUUVI_LIBRARIES_REQ "3.0.0"
 
 #define APP_SELFTEST_OK_DELAY_MS (1000U) //!< time to show "ok" led.
+
+/** @brief RESETREAS captured at application entry for the current boot. */
+uint32_t app_boot_resetreas_get (void);
 
 #ifdef CEEDLING
 void on_wdt (void);
