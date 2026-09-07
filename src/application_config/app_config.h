@@ -29,6 +29,11 @@
 /** @brief enable nRF15 SDK implementation of drivers */
 #define RUUVI_NRF5_SDK15_ENABLED (1U)
 
+/** @brief Enable full post-mortem diagnostics stack for lab builds. */
+#ifndef APP_POSTMORTEM_DIAGNOSTICS_ENABLED
+#   define APP_POSTMORTEM_DIAGNOSTICS_ENABLED (0U)
+#endif
+
 #ifndef APP_HEARTBEAT_OVERDUE_INTERVAL_MS
 #   define APP_HEARTBEAT_OVERDUE_INTERVAL_MS (5U * 60U * 1000U)
 #endif

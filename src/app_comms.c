@@ -4,12 +4,18 @@
 #include "app_led.h"
 #include "app_sensor.h"
 #include "app_testing.h"
+#if APP_POSTMORTEM_DIAGNOSTICS_ENABLED
+#include "main.h"
+#endif
 #include "ruuvi_boards.h"
 #include "ruuvi_endpoints.h"
 #include "ruuvi_interface_communication.h"
 #include "ruuvi_interface_communication_ble_advertising.h"
 #include "ruuvi_interface_communication_ble_gatt.h"
 #include "ruuvi_interface_communication_radio.h"
+#if APP_POSTMORTEM_DIAGNOSTICS_ENABLED
+#include "ruuvi_interface_power.h"
+#endif
 #include "ruuvi_interface_rtc.h"
 #include "ruuvi_interface_scheduler.h"
 #include "ruuvi_interface_timer.h"
@@ -18,6 +24,9 @@
 #include "ruuvi_task_communication.h"
 #include "ruuvi_task_gatt.h"
 #include "ruuvi_task_nfc.h"
+#if APP_POSTMORTEM_DIAGNOSTICS_ENABLED
+#include "ruuvi_task_flash.h"
+#endif
 #include <stdio.h>
 #include <string.h>
 
@@ -237,15 +246,18 @@ static rd_status_t password_check (const ri_comm_xfer_fp_t reply_fp,
     }
 
     m_tx_done = false;
+    rd_status_t reply_status = RD_SUCCESS;
 
     if (entered_password == current_password)
     {
-        err_code |= reply_authorized (reply_fp, raw_message);
+        reply_status = reply_authorized (reply_fp, raw_message);
+        err_code |= reply_status;
         auth_ok = true;
     }
     else
     {
-        err_code |= reply_unauthorized (reply_fp, raw_message);
+        reply_status = reply_unauthorized (reply_fp, raw_message);
+        err_code |= reply_status;
         auth_ok = false;
     }
 
@@ -275,6 +287,169 @@ static rd_status_t password_check (const ri_comm_xfer_fp_t reply_fp,
     return  err_code;
 }
 
+
+#if APP_POSTMORTEM_DIAGNOSTICS_ENABLED
+#define POSTMORTEM_CMD_REPORT "DIAG?"
+#define POSTMORTEM_CMD_CRASH  "CRASH"
+#define POSTMORTEM_CMD_CLEAR  "CLEAR"
+#define POSTMORTEM_CMD_RESET  "RSET!"
+#define POSTMORTEM_CMD_LEN     (5U)
+
+static uint16_t postmortem_filename_hash (const char * filename)
+{
+    uint16_t hash = 0x811CU;
+
+    if (NULL == filename)
+    {
+        return 0U;
+    }
+
+    while ('\0' != *filename)
+    {
+        hash ^= (uint8_t) *filename;
+        hash = (uint16_t) (hash * 0x0193U);
+        filename++;
+    }
+
+    return hash;
+}
+
+/*
+ * PM v2 packet, exactly 20 bytes:
+ *
+ *   50 4D 02 SS FF RR RR RR RR EE EE EE EE LL LL HH HH TT TT 00
+ *   P  M v2 src flg <boot RESETREAS> <fatal error> <line> <file hash>
+ *              <flash-load status low 16 bits> <reserved>
+ *
+ * SS is a persisted rt_reset_source_t.
+ * FF bit 0 = post-mortem record valid, bit 1 = fatal record valid.
+ * RESETREAS is captured at application entry and the sticky hardware bits are
+ * then cleared, so the value belongs to this boot rather than an older reset.
+ */
+static void postmortem_report_send (const ri_comm_xfer_fp_t reply_fp)
+{
+    rt_flash_postmortem_record_t record = {0};
+    const rd_status_t load_status = rt_flash_postmortem_load (&record);
+    const bool record_valid = (RD_SUCCESS == load_status)
+                              && (RT_FLASH_POSTMORTEM_MAGIC == record.magic);
+    const bool fatal_valid = record_valid && (0U != record.fatal_valid);
+
+    ri_comm_message_t msg = {0};
+    msg.data_length = 20U;
+    msg.repeat_count = 1U;
+    msg.data[0] = 0x50U; /* P */
+    msg.data[1] = 0x4DU; /* M */
+    msg.data[2] = 0x02U; /* version */
+    msg.data[3] = record_valid ? record.reset_source : (uint8_t) RT_RESET_SOURCE_NONE;
+    msg.data[4] = (record_valid ? 0x01U : 0U) | (fatal_valid ? 0x02U : 0U);
+
+    const uint32_t resetreas = app_boot_resetreas_get();
+    msg.data[5] = (uint8_t) ((resetreas >> 0U) & 0xFFU);
+    msg.data[6] = (uint8_t) ((resetreas >> 8U) & 0xFFU);
+    msg.data[7] = (uint8_t) ((resetreas >> 16U) & 0xFFU);
+    msg.data[8] = (uint8_t) ((resetreas >> 24U) & 0xFFU);
+
+    const rd_status_t fatal_error = fatal_valid ? record.error : RD_SUCCESS;
+    msg.data[9] = (uint8_t) ((fatal_error >> 0U) & 0xFFU);
+    msg.data[10] = (uint8_t) ((fatal_error >> 8U) & 0xFFU);
+    msg.data[11] = (uint8_t) ((fatal_error >> 16U) & 0xFFU);
+    msg.data[12] = (uint8_t) ((fatal_error >> 24U) & 0xFFU);
+
+    const uint16_t line = fatal_valid ? (uint16_t) record.line : 0U;
+    msg.data[13] = (uint8_t) ((line >> 0U) & 0xFFU);
+    msg.data[14] = (uint8_t) ((line >> 8U) & 0xFFU);
+
+    const uint16_t file_hash = fatal_valid ? postmortem_filename_hash (record.filename) : 0U;
+    msg.data[15] = (uint8_t) ((file_hash >> 0U) & 0xFFU);
+    msg.data[16] = (uint8_t) ((file_hash >> 8U) & 0xFFU);
+
+    msg.data[17] = (uint8_t) ((load_status >> 0U) & 0xFFU);
+    msg.data[18] = (uint8_t) ((load_status >> 8U) & 0xFFU);
+    msg.data[19] = 0U;
+
+    (void) app_comms_blocking_send (reply_fp, &msg);
+
+    /* Follow the PM header with up to four newest raw-journal entries.
+     * These survive a subsequent FDS init purge/reset. */
+    for (size_t i = 0U; i < 4U; i++)
+    {
+        rt_flash_postmortem_journal_record_t jr = {0};
+        if (RD_SUCCESS != rt_flash_postmortem_journal_load (i, &jr))
+        {
+            break;
+        }
+        ri_comm_message_t jmsg = {0};
+        jmsg.data_length = 20U;
+        jmsg.repeat_count = 1U;
+        jmsg.data[0] = 0x4AU; /* J */
+        jmsg.data[1] = 0x52U; /* R */
+        jmsg.data[2] = 0x01U; /* journal format */
+        jmsg.data[3] = (uint8_t) i;
+        jmsg.data[4] = jr.reset_source;
+        jmsg.data[5] = jr.fatal_valid ? 0x01U : 0U;
+        jmsg.data[6] = (uint8_t) ((jr.sequence >> 0U) & 0xFFU);
+        jmsg.data[7] = (uint8_t) ((jr.sequence >> 8U) & 0xFFU);
+        jmsg.data[8] = (uint8_t) ((jr.sequence >> 16U) & 0xFFU);
+        jmsg.data[9] = (uint8_t) ((jr.sequence >> 24U) & 0xFFU);
+        jmsg.data[10] = (uint8_t) ((jr.error >> 0U) & 0xFFU);
+        jmsg.data[11] = (uint8_t) ((jr.error >> 8U) & 0xFFU);
+        jmsg.data[12] = (uint8_t) ((jr.error >> 16U) & 0xFFU);
+        jmsg.data[13] = (uint8_t) ((jr.error >> 24U) & 0xFFU);
+        const uint16_t jr_line = (uint16_t) jr.line;
+        jmsg.data[14] = (uint8_t) ((jr_line >> 0U) & 0xFFU);
+        jmsg.data[15] = (uint8_t) ((jr_line >> 8U) & 0xFFU);
+        jmsg.data[16] = (uint8_t) ((jr.file_hash >> 0U) & 0xFFU);
+        jmsg.data[17] = (uint8_t) ((jr.file_hash >> 8U) & 0xFFU);
+        jmsg.data[18] = 0U;
+        jmsg.data[19] = 0U;
+        (void) app_comms_blocking_send (reply_fp, &jmsg);
+    }
+}
+
+static bool postmortem_command_handle (const ri_comm_xfer_fp_t reply_fp,
+                                       const uint8_t * const data,
+                                       const size_t data_len)
+{
+    if ((NULL == data) || (POSTMORTEM_CMD_LEN != data_len))
+    {
+        return false;
+    }
+
+    if (0 == memcmp (data, POSTMORTEM_CMD_REPORT, POSTMORTEM_CMD_LEN))
+    {
+        postmortem_report_send (reply_fp);
+        return true;
+    }
+
+    if (0 == memcmp (data, POSTMORTEM_CMD_CLEAR, POSTMORTEM_CMD_LEN))
+    {
+        (void) rt_flash_postmortem_clear_sync();
+        return true;
+    }
+
+    if (0 == memcmp (data, POSTMORTEM_CMD_CRASH, POSTMORTEM_CMD_LEN))
+    {
+        /*
+         * Intentional validation of the exact production fatal path:
+         * rd_error_check() -> app_on_error() -> persistent post-mortem store ->
+         * ri_power_reset().
+         */
+        RD_ERROR_CHECK (RD_ERROR_INVALID_STATE, RD_SUCCESS);
+        return true;
+    }
+
+    if (0 == memcmp (data, POSTMORTEM_CMD_RESET, POSTMORTEM_CMD_LEN))
+    {
+        /* Validate a direct software reset that bypasses app_on_error(). */
+        (void) rt_flash_postmortem_store_reset_sync (RT_RESET_SOURCE_DIAG_DIRECT);
+        ri_power_reset();
+        return true;
+    }
+
+    return false;
+}
+#endif
+
 TESTABLE_STATIC void handle_comms (const ri_comm_xfer_fp_t reply_fp, void * p_data,
                                    size_t data_len)
 {
@@ -285,6 +460,12 @@ TESTABLE_STATIC void handle_comms (const ri_comm_xfer_fp_t reply_fp, void * p_da
     {
         err_code |= RD_ERROR_NULL;
     }
+#if APP_POSTMORTEM_DIAGNOSTICS_ENABLED
+    else if (postmortem_command_handle (reply_fp, raw_message, data_len))
+    {
+        return;
+    }
+#endif
     else if (data_len < RE_STANDARD_MESSAGE_LENGTH)
     {
         err_code |= RD_ERROR_INVALID_PARAM;

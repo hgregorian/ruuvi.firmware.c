@@ -12,6 +12,9 @@
 #include "app_led.h"
 #include "ruuvi_boards.h"
 #include "ruuvi_task_led.h"
+#if APP_POSTMORTEM_DIAGNOSTICS_ENABLED
+#include "ruuvi_task_flash.h"
+#endif
 #include "ruuvi_interface_power.h"
 #include "ruuvi_interface_rtc.h"
 #include "ruuvi_interface_scheduler.h"
@@ -381,6 +384,9 @@ static void cart_idle (void * p_event, uint16_t event_size)
     if (m_gesture_state == CART_GESTURE_WAIT_IDLE)
     {
         cart_gesture_confirm_blink();
+#if APP_POSTMORTEM_DIAGNOSTICS_ENABLED
+        (void) rt_flash_postmortem_store_reset_sync (RT_RESET_SOURCE_CART_GESTURE);
+#endif
         ri_power_reset();
     }
 

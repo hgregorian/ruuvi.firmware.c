@@ -32,6 +32,30 @@
 #include "ruuvi_task_led.h"
 #include "ruuvi_task_adc.h"
 
+#if APP_POSTMORTEM_DIAGNOSTICS_ENABLED
+
+#ifndef CEEDLING
+#include "nrf.h"
+#endif
+
+static uint32_t m_boot_resetreas;
+
+uint32_t app_boot_resetreas_get (void)
+{
+    return m_boot_resetreas;
+}
+
+#ifndef CEEDLING
+static void app_boot_resetreas_capture (void)
+{
+    m_boot_resetreas = NRF_POWER->RESETREAS;
+    /* RESETREAS bits are sticky. Writing 1 clears only the captured bits. */
+    NRF_POWER->RESETREAS = m_boot_resetreas;
+}
+#endif
+
+#endif
+
 #if (!RUUVI_RUN_TESTS)
 #ifndef CEEDLING
 static
@@ -50,9 +74,16 @@ void app_on_error (const rd_status_t error,
                    const char * file,
                    const int line)
 {
-    // TODO: store error source to flash.
     if (fatal)
     {
+#if APP_POSTMORTEM_DIAGNOSTICS_ENABLED
+        /*
+         * Best-effort persistent post-mortem capture before the normal
+         * software reset. This does not touch GPREGRET, GPREGRET2 or
+         * RESETREAS.
+         */
+        (void) rt_flash_postmortem_store_fatal_sync (error, file, line);
+#endif
         ri_power_reset();
     }
 }
@@ -108,6 +139,9 @@ int app_main (void)
 int main (void)
 #endif
 {
+#if APP_POSTMORTEM_DIAGNOSTICS_ENABLED && !defined(CEEDLING)
+    app_boot_resetreas_capture();
+#endif
 #   if RUUVI_RUN_TESTS
     integration_tests_run();
 #   endif
