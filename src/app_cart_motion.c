@@ -9,17 +9,10 @@
 #include "app_comms.h"
 #include "app_config.h"
 #include "app_heartbeat.h"
-#include "app_led.h"
 #include "ruuvi_boards.h"
-#include "ruuvi_task_led.h"
-#if APP_POSTMORTEM_DIAGNOSTICS_ENABLED
-#include "ruuvi_task_flash.h"
-#endif
-#include "ruuvi_interface_power.h"
 #include "ruuvi_interface_rtc.h"
 #include "ruuvi_interface_scheduler.h"
 #include "ruuvi_interface_timer.h"
-#include "ruuvi_interface_yield.h"
 
 #include <math.h>
 #include <stdbool.h>
@@ -36,21 +29,6 @@
 
 #define CART_DUMP_CONFIRM_MS        (300U)
 #define CART_DUMP_MIN_HOLD_MS       (15U * 1000U)
-
-#define CART_GESTURE_TIP_ANGLE_DEG       (55.0F)
-#define CART_GESTURE_UPRIGHT_ANGLE_DEG   (15.0F)
-#define CART_GESTURE_STEP_TIMEOUT_MS     (5U * 1000U)
-#define CART_GESTURE_TIP_COUNT           (3U)
-
-#define CART_GESTURE_DIAG_NONE            (0U)
-#define CART_GESTURE_DIAG_TIP_1           (1U)
-#define CART_GESTURE_DIAG_TIP_2           (2U)
-#define CART_GESTURE_DIAG_TIP_3           (3U)
-#define CART_GESTURE_DIAG_WAIT_IDLE       (4U)
-
-#define CART_GESTURE_DIAG_ABORT_DUMP       (8U)
-#define CART_GESTURE_DIAG_ABORT_TIMEOUT    (9U)
-#define CART_GESTURE_DIAG_ABORT_WAIT_IDLE (10U)
 
 /*
  * Consider the cart inverted when its acceleration vector is at least
@@ -89,7 +67,6 @@ static bool m_active;
 static bool m_have_previous_sample;
 
 static bool m_have_upright_sample;
-static bool m_have_gesture_reference;
 static bool m_dump_candidate;
 static bool m_dump_latched;
 static bool m_dump_armed;
@@ -103,10 +80,6 @@ static float m_upright_x;
 static float m_upright_y;
 static float m_upright_z;
 
-static float m_gesture_ref_x;
-static float m_gesture_ref_y;
-static float m_gesture_ref_z;
-
 static uint64_t m_last_motion_ms;
 static uint64_t m_dump_candidate_since_ms;
 static uint64_t m_dump_min_hold_until_ms;
@@ -115,165 +88,6 @@ static bool m_moving_candidate;
 static bool m_moving;
 static uint64_t m_moving_candidate_since_ms;
 static uint64_t m_last_rolling_motion_ms;
-
-static uint8_t m_gesture_diag;
-
-typedef enum
-{
-    CART_GESTURE_IDLE = 0,
-    CART_GESTURE_IN_PROGRESS,
-    CART_GESTURE_WAIT_IDLE
-} cart_gesture_state_t;
-
-static cart_gesture_state_t m_gesture_state;
-static uint8_t m_gesture_tip_count;
-static bool m_gesture_waiting_for_upright;
-static uint64_t m_gesture_step_since_ms;
-
-static void cart_gesture_blink (const uint32_t duration_ms)
-{
-    app_led_error_signal (true);
-    (void) ri_delay_ms (duration_ms);
-    app_led_error_signal (false);
-}
-
-static void cart_gesture_confirm_blink (void)
-{
-    for (uint8_t ii = 0U; ii < 5U; ii++)
-    {
-        app_led_error_signal (true);
-        (void) ri_delay_ms (250U);
-        app_led_error_signal (false);
-        (void) ri_delay_ms (250U);
-    }
-}
-
-static void cart_gesture_reset (const uint8_t diag)
-{
-    m_gesture_state = CART_GESTURE_IDLE;
-    m_gesture_tip_count = 0U;
-    m_gesture_waiting_for_upright = false;
-    m_gesture_step_since_ms = 0U;
-    m_gesture_diag = diag;
-
-    app_led_error_signal (false);
-}
-
-static void cart_gesture_update (const float angle_deg,
-                                 const uint64_t now_ms)
-{
-    const bool gesture_upright =
-        angle_deg <= CART_GESTURE_UPRIGHT_ANGLE_DEG;
-
-    const bool gesture_tip =
-        (angle_deg >= CART_GESTURE_TIP_ANGLE_DEG) &&
-        (angle_deg < CART_DUMP_ANGLE_DEG);
-
-    /*
-     * Entering the dump orientation invalidates any commissioning gesture in
-     * progress. A normal dump may pass through the gesture angle range, but it
-     * must never contribute toward a commissioning reset.
-     */
-    if (angle_deg >= CART_DUMP_ANGLE_DEG)
-    {
-        cart_gesture_reset(CART_GESTURE_DIAG_ABORT_DUMP);
-        return;
-    }
-
-    if ((m_gesture_state == CART_GESTURE_IN_PROGRESS) &&
-        ((now_ms - m_gesture_step_since_ms) >
-         CART_GESTURE_STEP_TIMEOUT_MS))
-    {
-        cart_gesture_reset (CART_GESTURE_DIAG_ABORT_TIMEOUT);
-        return;
-    }
-
-    switch (m_gesture_state)
-    {
-
-        case CART_GESTURE_IDLE:
-            /*
-             * Wait indefinitely for the first deliberate commissioning tip.
-             * The first accepted tip starts the timed gesture sequence.
-             */
-            if (gesture_tip)
-            {
-                m_gesture_state = CART_GESTURE_IN_PROGRESS;
-                m_gesture_tip_count = 1U;
-                m_gesture_waiting_for_upright = true;
-                m_gesture_step_since_ms = now_ms;
-                m_gesture_diag = CART_GESTURE_DIAG_TIP_1;
-
-                cart_gesture_blink (500U);
-            }
-            break;
-
-        case CART_GESTURE_IN_PROGRESS:
-            if (!m_gesture_waiting_for_upright)
-            {
-                /*
-                 * Wait for the next deliberate tip.
-                 */
-                if (gesture_tip)
-                {
-                    m_gesture_tip_count++;
-                    m_gesture_waiting_for_upright = true;
-                    m_gesture_step_since_ms = now_ms;
-               
-                    if (1U == m_gesture_tip_count)
-                    {
-                        m_gesture_diag = CART_GESTURE_DIAG_TIP_1;
-                    }
-                    else if (2U == m_gesture_tip_count)
-                    {
-                        m_gesture_diag = CART_GESTURE_DIAG_TIP_2;
-                    }
-                    else if (3U == m_gesture_tip_count)
-                    {
-                        m_gesture_diag = CART_GESTURE_DIAG_TIP_3;
-                    }
-
-                    cart_gesture_blink (500U);
-                }
-            }
-            else if (gesture_upright)
-            {
-                /*
-                 * Every tip must be followed by a full return upright.
-                 */
-
-                cart_gesture_blink (500U);
-
-                if (m_gesture_tip_count >= CART_GESTURE_TIP_COUNT)
-                {
-                    m_gesture_state = CART_GESTURE_WAIT_IDLE;
-                    m_gesture_diag = CART_GESTURE_DIAG_WAIT_IDLE;
-                }
-                else
-                {
-                    m_gesture_waiting_for_upright = false;
-                    m_gesture_step_since_ms = now_ms;
-                }
-            }
-            break;
-
-        case CART_GESTURE_WAIT_IDLE:
-            /*
-             * The completed gesture remains valid only while the cart stays in
-             * its commissioning upright posture. cart_idle() performs the reset
-             * once the normal idle timeout has elapsed.
-             */
-            // if (!gesture_upright)
-            // {
-            //     cart_gesture_reset(CART_GESTURE_DIAG_ABORT_WAIT_IDLE);
-            // }
-            break;
-
-        default:
-            cart_gesture_reset(CART_GESTURE_DIAG_NONE);
-            break;
-    }
-}
 
 static float cart_angle_from_reference_deg (const float x,
                                             const float y,
@@ -377,34 +191,6 @@ static void cart_idle (void * p_event, uint16_t event_size)
     }
 
     /*
-     * A completed commissioning gesture requests a reboot once the cart has
-     * reached the normal idle condition. Startup will then establish a fresh
-     * upright reference.
-     */
-    if (m_gesture_state == CART_GESTURE_WAIT_IDLE)
-    {
-        cart_gesture_confirm_blink();
-#if APP_POSTMORTEM_DIAGNOSTICS_ENABLED
-        (void) rt_flash_postmortem_store_reset_sync (RT_RESET_SOURCE_CART_GESTURE);
-#endif
-        ri_power_reset();
-    }
-
-    /*
-     * The cart has now been quiet for CART_IDLE_TIMEOUT_MS. Preserve its
-     * settled orientation as the reference for the next commissioning gesture
-     * attempt. This lets the first movement after idle be tip #1 rather than
-     * requiring a separate wake-and-settle step.
-     */
-    if (m_have_previous_sample)
-    {
-        m_gesture_ref_x = m_previous_x;
-        m_gesture_ref_y = m_previous_y;
-        m_gesture_ref_z = m_previous_z;
-        m_have_gesture_reference = true;
-    }
-
-    /*
      * Stop motion evaluation before taking the final sample so the final
      * heartbeat cannot restart the inactivity timer.
      */
@@ -454,8 +240,6 @@ static void cart_motion (void * p_event, uint16_t event_size)
         m_active = true;
         m_have_previous_sample = false;
 
-        cart_gesture_reset (CART_GESTURE_DIAG_NONE);
-
         /*
          * Generate fresh telemetry immediately rather than waiting for the
          * first CART_MOTION_INTERVAL_MS heartbeat timer expiration.
@@ -477,7 +261,6 @@ rd_status_t app_cart_motion_init (void)
         m_active = false;
         m_have_previous_sample = false;
         m_have_upright_sample = false;
-        m_have_gesture_reference = false;
 
         m_dump_candidate = false;
         m_dump_latched = false;
@@ -493,12 +276,6 @@ rd_status_t app_cart_motion_init (void)
 
         m_moving_candidate_since_ms = 0U;
         m_last_rolling_motion_ms = 0U;
-
-        m_gesture_state = CART_GESTURE_IDLE;
-        m_gesture_tip_count = 0U;
-        m_gesture_waiting_for_upright = false;
-        m_gesture_step_since_ms = 0U;
-        m_gesture_diag = CART_GESTURE_DIAG_NONE;
 
         err_code |= ri_timer_create (&m_idle_timer,
                                      RI_TIMER_MODE_SINGLE_SHOT,
@@ -537,10 +314,8 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
     }
 
     /*
-     * The first valid accelerometer sample after startup establishes the
-     * permanent cart upright reference, even while motion processing is idle.
-     * This lets the stationary startup heartbeat following commissioning
-     * re-home the cart before its next movement.
+     * This lets the stationary startup heartbeat following a reboot establish
+     * the permanent upright reference before active motion processing begins.
      */
     if (!m_have_upright_sample)
     {
@@ -552,8 +327,8 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
 
     /*
      * Idle/startup samples may establish the permanent upright reference, but
-     * all DUMP, MOVING, gesture, and active-telemetry processing remains gated
-     * by m_active.
+     * all DUMP, MOVING, and active-telemetry processing remains gated by
+     * m_active.
      */
     if (!m_active)
     {
@@ -703,20 +478,6 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
             m_moving_candidate = false;
             m_moving = false;
         }
-
-        if (m_have_gesture_reference)
-        {
-            const float gesture_angle_deg =
-                cart_angle_from_reference_deg (
-                    x,
-                    y,
-                    z,
-                    m_gesture_ref_x,
-                    m_gesture_ref_y,
-                    m_gesture_ref_z);
-
-            cart_gesture_update (gesture_angle_deg, now_ms);
-        }
     }
     else
     {
@@ -747,9 +508,4 @@ uint8_t app_cart_motion_status_get (void)
     }
 
     return APP_CART_STATUS_NORMAL;
-}
-
-uint8_t app_cart_motion_gesture_status_get (void)
-{
-    return m_gesture_diag;
 }
