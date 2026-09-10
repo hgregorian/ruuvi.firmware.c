@@ -71,6 +71,29 @@ rd_status_t app_heartbeat_stop (void);
 rd_status_t app_heartbeat_interval_set (const uint32_t interval_ms);
 
 /**
+ * @brief Temporarily override the heartbeat interval.
+ *
+ * The normal interval configured through app_heartbeat_interval_set() remains
+ * stored underneath the override. Clearing the override restores the most
+ * recently requested normal interval.
+ *
+ * @param[in] interval_ms Temporary heartbeat interval in milliseconds.
+ *
+ * @retval RD_SUCCESS on success.
+ * @retval RD_ERROR_INVALID_STATE if heartbeat is not initialized.
+ * @retval RD_ERROR_INVALID_PARAM if interval_ms is zero.
+ */
+rd_status_t app_heartbeat_interval_override_set (const uint32_t interval_ms);
+
+/**
+ * @brief Clear the temporary heartbeat interval override.
+ *
+ * @retval RD_SUCCESS on success.
+ * @retval RD_ERROR_INVALID_STATE if heartbeat is not initialized.
+ */
+rd_status_t app_heartbeat_interval_override_clear (void);
+
+/**
  * @brief Immediately read sensors and transmit a fresh heartbeat.
  */
 void app_heartbeat_now (void);

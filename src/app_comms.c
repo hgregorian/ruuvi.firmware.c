@@ -49,6 +49,10 @@
 /** @brief Set to long enough to handle existing queue, then as short as possible. */
 #define BLOCKING_COMM_TIMEOUT_MS (4000U)
 #define CONN_PARAM_UPDATE_DELAY_MS (30U * 1000U) //!< Delay before switching to faster conn params in long ops.
+#define MANAGEMENT_CMD "MGMT"
+#define MANAGEMENT_CMD_LEN (4U)
+#define MANAGEMENT_HEARTBEAT_INTERVAL_MS (1000U)
+#define MANAGEMENT_IDLE_TIMEOUT_MS (15U * 1000U)
 
 #if APP_COMMS_BIDIR_ENABLED
 TESTABLE_STATIC bool
@@ -69,7 +73,9 @@ static volatile bool m_tx_done; //!< Flag for data transfer done
 static volatile bool m_config_enable_after_disconnect; //!< Rebuild GATT in config mode after a real GAP disconnect.
 static uint8_t m_bleadv_repeat_count; //!< Number of times to repeat advertisement.
 TESTABLE_STATIC ri_timer_id_t m_comm_timer;    //!< Timer for communication mode changes.
+static ri_timer_id_t m_management_timer; //!< Timer for management inactivity.
 TESTABLE_STATIC mode_changes_t m_mode_ops;     //!< Pending mode changes.
+static bool m_management_active;
 
 uint8_t app_comms_bleadv_send_count_get (void)
 {
@@ -288,6 +294,63 @@ static rd_status_t password_check (const ri_comm_xfer_fp_t reply_fp,
 }
 
 
+static void management_disable (void * p_data, uint16_t data_len)
+{
+    (void) p_data;
+    (void) data_len;
+
+    if (m_management_active)
+    {
+        m_management_active = false;
+        const rd_status_t err_code = app_heartbeat_interval_override_clear();
+        RD_ERROR_CHECK (err_code, ~RD_ERROR_FATAL);
+    }
+}
+
+static void management_timeout_isr (void * const p_context)
+{
+    (void) p_context;
+    const rd_status_t err_code =
+        ri_scheduler_event_put (NULL, 0U, &management_disable);
+    RD_ERROR_CHECK (err_code, RD_SUCCESS);
+}
+
+static void management_activity_touch (void)
+{
+    rd_status_t err_code = RD_SUCCESS;
+
+    if (!m_management_active)
+    {
+        m_management_active = true;
+        err_code |= app_heartbeat_interval_override_set (
+                        MANAGEMENT_HEARTBEAT_INTERVAL_MS);
+    }
+
+    err_code |= ri_timer_stop (m_management_timer);
+    err_code |= ri_timer_start (
+                    m_management_timer,
+                    MANAGEMENT_IDLE_TIMEOUT_MS,
+                    NULL);
+    RD_ERROR_CHECK (err_code, ~RD_ERROR_FATAL);
+}
+
+static bool management_command_handle (const uint8_t * const data,
+                                       const size_t data_len)
+{
+    if ((NULL == data) || (MANAGEMENT_CMD_LEN != data_len))
+    {
+        return false;
+    }
+
+    if (0 == memcmp (data, MANAGEMENT_CMD, MANAGEMENT_CMD_LEN))
+    {
+        management_activity_touch();
+        return true;
+    }
+
+    return false;
+}
+
 #if APP_POSTMORTEM_DIAGNOSTICS_ENABLED
 #define POSTMORTEM_CMD_REPORT "DIAG?"
 #define POSTMORTEM_CMD_CRASH  "CRASH"
@@ -460,6 +523,10 @@ TESTABLE_STATIC void handle_comms (const ri_comm_xfer_fp_t reply_fp, void * p_da
     {
         err_code |= RD_ERROR_NULL;
     }
+    else if (management_command_handle (raw_message, data_len))
+    {
+        return;
+    }
 #if APP_POSTMORTEM_DIAGNOSTICS_ENABLED
     else if (postmortem_command_handle (reply_fp, raw_message, data_len))
     {
@@ -558,6 +625,10 @@ static void config_cleanup_on_disconnect (void)
 
 TESTABLE_STATIC void handle_gatt_data (void * p_data, uint16_t data_len)
 {
+    if (m_management_active)
+    {
+        management_activity_touch();
+    }
     handle_comms (&rt_gatt_send_asynchronous, p_data, data_len);
 }
 
@@ -566,6 +637,11 @@ TESTABLE_STATIC void handle_gatt_data (void * p_data, uint16_t data_len)
  */
 TESTABLE_STATIC void handle_gatt_connected (void * p_data, uint16_t data_len)
 {
+    if (m_management_active)
+    {
+        management_activity_touch();
+    }
+
     rd_status_t err_code = RD_SUCCESS;
     // Disables advertising for GATT, does not kick current connetion out.
     err_code |= rt_gatt_adv_disable ();
@@ -908,6 +984,8 @@ rd_status_t app_comms_init (const bool secure)
     err_code |= ri_radio_init (APP_MODULATION);
     err_code |= ri_timer_create (&m_comm_timer, RI_TIMER_MODE_SINGLE_SHOT,
                                  &comm_mode_change_isr);
+    err_code |= ri_timer_create (&m_management_timer, RI_TIMER_MODE_SINGLE_SHOT,
+                                 &management_timeout_isr);
 
     if (RD_SUCCESS == err_code)
     {

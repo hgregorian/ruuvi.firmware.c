@@ -36,6 +36,7 @@
 static ri_timer_id_t heart_timer; //!< Timer for updating data.
 
 static uint32_t heart_interval_ms = APP_HEARTBEAT_INTERVAL_MS;
+static uint32_t heart_interval_override_ms;
 
 static uint64_t last_heartbeat_timestamp_ms; //!< Timestamp for heartbeat refresh.
 
@@ -48,6 +49,16 @@ static app_dataformats_t m_dataformats_enabled =
     .DF_8  = APP_DF_8_ENABLED,
     .DF_FA = APP_DF_FA_ENABLED
 }; //!< Flags of enabled formats
+
+static uint32_t heartbeat_interval_effective (void)
+{
+    if (0U != heart_interval_override_ms)
+    {
+        return heart_interval_override_ms;
+    }
+
+    return heart_interval_ms;
+}
 
 static rd_status_t send_adv (ri_comm_message_t * const p_msg)
 {
@@ -169,7 +180,7 @@ rd_status_t app_heartbeat_init (void)
 
         if (RD_SUCCESS == err_code)
         {
-            err_code |= ri_timer_start (heart_timer, heart_interval_ms, NULL);
+            err_code |= ri_timer_start (heart_timer, heartbeat_interval_effective(), NULL);
         }
     }
 
@@ -187,7 +198,7 @@ rd_status_t app_heartbeat_start (void)
     else
     {
         heartbeat (NULL, 0);
-        err_code |= ri_timer_start (heart_timer, heart_interval_ms, NULL);
+        err_code |= ri_timer_start (heart_timer, heartbeat_interval_effective(), NULL);
     }
 
     return err_code;
@@ -221,7 +232,52 @@ rd_status_t app_heartbeat_interval_set (const uint32_t interval_ms)
     {
         heart_interval_ms = interval_ms;
         err_code |= ri_timer_stop (heart_timer);
-        err_code |= ri_timer_start (heart_timer, heart_interval_ms, NULL);
+        err_code |= ri_timer_start (heart_timer, heartbeat_interval_effective(), NULL);
+    }
+
+    return err_code;
+}
+
+
+rd_status_t app_heartbeat_interval_override_set (const uint32_t interval_ms)
+{
+    rd_status_t err_code = RD_SUCCESS;
+    if (NULL == heart_timer)
+    {
+        err_code |= RD_ERROR_INVALID_STATE;
+    }
+    else if (0U == interval_ms)
+    {
+        err_code |= RD_ERROR_INVALID_PARAM;
+    }
+    else
+    {
+        heart_interval_override_ms = interval_ms;
+        err_code |= ri_timer_stop (heart_timer);
+        err_code |= ri_timer_start (
+                        heart_timer,
+                        heartbeat_interval_effective(),
+                        NULL);
+    }
+
+    return err_code;
+}
+
+rd_status_t app_heartbeat_interval_override_clear (void)
+{
+    rd_status_t err_code = RD_SUCCESS;
+    if (NULL == heart_timer)
+    {
+        err_code |= RD_ERROR_INVALID_STATE;
+    }
+    else
+    {
+        heart_interval_override_ms = 0U;
+        err_code |= ri_timer_stop (heart_timer);
+        err_code |= ri_timer_start (
+                        heart_timer,
+                        heartbeat_interval_effective(),
+                        NULL);
     }
 
     return err_code;
