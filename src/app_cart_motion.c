@@ -86,7 +86,7 @@ static uint8_t m_dump_candidate_hits;
 static uint64_t m_dump_min_hold_until_ms;
 static bool m_rolling_candidate;
 static bool m_rolling;
-static uint64_t m_rolling_candidate_since_ms;
+static uint32_t m_rolling_evidence_ms;
 static uint64_t m_last_rolling_motion_ms;
 
 static float cart_angle_from_reference_deg (const float x,
@@ -211,6 +211,7 @@ static void cart_idle (void * p_event, uint16_t event_size)
     m_have_previous_sample = false;
     m_rolling_candidate = false;
     m_rolling = false;
+    m_rolling_evidence_ms = 0U;
 
     /*
      * Send one final fresh sample while fast advertising is still active.
@@ -286,7 +287,7 @@ rd_status_t app_cart_motion_init (void)
         m_rolling_candidate = false;
         m_rolling = false;
 
-        m_rolling_candidate_since_ms = 0U;
+        m_rolling_evidence_ms = 0U;
         m_last_rolling_motion_ms = 0U;
 
         err_code |= ri_timer_create (&m_idle_timer,
@@ -484,25 +485,30 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
         {
             /*
              * A gap longer than CART_ROLLING_GAP_TOLERANCE_MS starts a new
-             * sustained rolling-motion candidate.
+             * sustained rolling-motion candidate. Shorter interruptions are
+             * tolerated, but do not count toward CART_ROLLING_CONFIRM_MS.
              */
             if (m_rolling_candidate &&
                 ((now_ms - m_last_rolling_motion_ms) >
                  CART_ROLLING_GAP_TOLERANCE_MS))
             {
                 m_rolling_candidate = false;
+                m_rolling_evidence_ms = 0U;
             }
             if ((!m_rolling) && (!m_rolling_candidate))
             {
                 m_rolling_candidate = true;
-                m_rolling_candidate_since_ms = now_ms;
+                m_rolling_evidence_ms = 0U;
             }
-            else if (m_rolling_candidate &&
-                     ((now_ms - m_rolling_candidate_since_ms) >=
-                      CART_ROLLING_CONFIRM_MS))
+            if (m_rolling_candidate)
             {
-                m_rolling_candidate = false;
-                m_rolling = true;
+                m_rolling_evidence_ms += CART_MOTION_INTERVAL_MS;
+
+                if (m_rolling_evidence_ms >= CART_ROLLING_CONFIRM_MS)
+                {
+                    m_rolling_candidate = false;
+                    m_rolling = true;
+                }
             }
             m_last_rolling_motion_ms = now_ms;
         }
@@ -512,6 +518,7 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
         {
             m_rolling_candidate = false;
             m_rolling = false;
+            m_rolling_evidence_ms = 0U;
         }
     }
     else
