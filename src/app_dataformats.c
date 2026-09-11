@@ -113,7 +113,7 @@ encode_to_5 (uint8_t * const output,
      *
      *   status 0: NORMAL
      *   status 1: DUMP
-     *   status 2: MOVING
+     *   status 2: ROLLING
      *   status 3: reserved
      *
      * Bits 5..0 contain the rolling report sequence.

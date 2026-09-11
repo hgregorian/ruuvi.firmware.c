@@ -18,7 +18,7 @@
  */
 #define APP_CART_STATUS_NORMAL       (0U)
 #define APP_CART_STATUS_DUMP         (1U)
-#define APP_CART_STATUS_MOVING       (2U)
+#define APP_CART_STATUS_ROLLING      (2U)
 #define APP_CART_STATUS_RESERVED     (3U)
 
 /**
