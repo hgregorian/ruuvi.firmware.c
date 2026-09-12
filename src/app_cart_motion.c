@@ -38,6 +38,41 @@
  */
 #define CART_DUMP_ANGLE_DEG         (135.0F)
 
+
+/*
+ * Time constant for the low-pass filter used to estimate cart orientation
+ * for DUMP/upright detection.
+ *
+ * The effective EMA coefficient is calculated from the active sample interval:
+ *
+ *     alpha = 1 - exp(-sample_interval / CART_DUMP_FILTER_TAU_MS)
+ *
+ * With CART_MOTION_INTERVAL_MS = 100 ms and TAU = 280 ms:
+ *
+ *     alpha ~= 0.30
+ *
+ * Smaller TAU:
+ *   - reacts faster to real cart rotation
+ *   - passes more vibration / impact acceleration
+ *   - increases risk of false DUMP detection
+ *
+ * Larger TAU:
+ *   - rejects short acceleration spikes more strongly
+ *   - produces a smoother gravity/orientation estimate
+ *   - delays recognition of fast dump events
+ *
+ * Approximate examples at a 100 ms sample interval:
+ *
+ *     TAU  150 ms -> alpha ~= 0.49  (light filtering)
+ *     TAU  280 ms -> alpha ~= 0.30  (current setting)
+ *     TAU  500 ms -> alpha ~= 0.18  (stronger filtering)
+ *     TAU 1000 ms -> alpha ~= 0.10  (very sluggish)
+ *
+ * Because alpha is derived from the sample interval, changing the active
+ * sampling rate preserves approximately the same real-world filter response.
+ */
+#define CART_DUMP_FILTER_TAU_MS     (280.0F)
+
 /*
  * Consider the cart returned upright when its acceleration vector is at most
  * CART_UPRIGHT_ANGLE_DEG from the upright reference vector.
@@ -67,6 +102,7 @@ static ri_timer_id_t m_idle_timer;
 static bool m_active;
 static bool m_have_previous_sample;
 static bool m_have_upright_sample;
+static bool m_have_dump_filter;
 static bool m_dump_candidate;
 static bool m_dump_latched;
 static bool m_dump_armed;
@@ -79,6 +115,11 @@ static float m_previous_z;
 static float m_upright_x;
 static float m_upright_y;
 static float m_upright_z;
+
+static float m_dump_filtered_x;
+static float m_dump_filtered_y;
+static float m_dump_filtered_z;
+static float m_dump_filter_alpha;
 
 static uint64_t m_last_motion_ms;
 static uint8_t m_dump_candidate_samples;
@@ -209,6 +250,7 @@ static void cart_idle (void * p_event, uint16_t event_size)
      */
     m_active = false;
     m_have_previous_sample = false;
+    m_have_dump_filter = false;
     m_rolling_candidate = false;
     m_rolling = false;
     m_rolling_evidence_ms = 0U;
@@ -254,6 +296,7 @@ static void cart_motion (void * p_event, uint16_t event_size)
 
         m_active = true;
         m_have_previous_sample = false;
+        m_have_dump_filter = false;
 
         /*
          * Generate fresh telemetry immediately rather than waiting for the
@@ -276,6 +319,7 @@ rd_status_t app_cart_motion_init (void)
         m_active = false;
         m_have_previous_sample = false;
         m_have_upright_sample = false;
+        m_have_dump_filter = false;
 
         cart_dump_candidate_reset();
         m_dump_latched = false;
@@ -289,6 +333,11 @@ rd_status_t app_cart_motion_init (void)
 
         m_rolling_evidence_ms = 0U;
         m_last_rolling_motion_ms = 0U;
+
+        m_dump_filter_alpha =
+            1.0F - expf (
+                -((float) CART_MOTION_INTERVAL_MS) /
+                CART_DUMP_FILTER_TAU_MS);
 
         err_code |= ri_timer_create (&m_idle_timer,
                                      RI_TIMER_MODE_SINGLE_SHOT,
@@ -361,6 +410,28 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
 
     const uint64_t now_ms = ri_rtc_millis();
 
+    /*
+     * Use a low-pass filtered acceleration vector for DUMP orientation so
+     * short wheel impacts and vibration cannot dominate the gravity estimate.
+     * ROLLING and sample-to-sample motion continue to use the raw XYZ values.
+     */
+    if (!m_have_dump_filter)
+    {
+        m_dump_filtered_x = x;
+        m_dump_filtered_y = y;
+        m_dump_filtered_z = z;
+        m_have_dump_filter = true;
+    }
+    else
+    {
+        m_dump_filtered_x +=
+            m_dump_filter_alpha * (x - m_dump_filtered_x);
+        m_dump_filtered_y +=
+            m_dump_filter_alpha * (y - m_dump_filtered_y);
+        m_dump_filtered_z +=
+            m_dump_filter_alpha * (z - m_dump_filtered_z);
+    }
+
     const float angle_deg =
         cart_angle_from_reference_deg (
             x,
@@ -370,11 +441,20 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
             m_upright_y,
             m_upright_z);
 
+    const float dump_angle_deg =
+        cart_angle_from_reference_deg (
+            m_dump_filtered_x,
+            m_dump_filtered_y,
+            m_dump_filtered_z,
+            m_upright_x,
+            m_upright_y,
+            m_upright_z);
+
     const bool inverted =
-        cart_is_inverted (angle_deg);
+        cart_is_inverted (dump_angle_deg);
 
     const bool upright =
-        cart_is_upright (angle_deg);
+        cart_is_upright (dump_angle_deg);
 
     const bool rolling =
         cart_is_rolling (angle_deg);
