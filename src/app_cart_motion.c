@@ -89,6 +89,7 @@
  */
 #define CART_DUMP_CONFIDENCE_ONSET_G (1.8F)
 #define CART_DUMP_CONFIDENCE_DECAY_G (1.0F)
+#define CART_DUMP_MIN_HIT_CONFIDENCE (0.75F)
 
 /*
  * Consider the cart returned upright when its acceleration vector is at most
@@ -435,6 +436,20 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
      * short wheel impacts and vibration cannot dominate the gravity estimate.
      * ROLLING and sample-to-sample motion continue to use the raw XYZ values.
      */
+    const float sample_mag =
+        sqrtf ((x * x) + (y * y) + (z * z));
+    const float sample_g =
+        sample_mag / m_upright_mag;
+    float confidence = 1.0F;
+
+    if (sample_g > CART_DUMP_CONFIDENCE_ONSET_G)
+    {
+        confidence =
+            expf (
+                -(sample_g - CART_DUMP_CONFIDENCE_ONSET_G) /
+                CART_DUMP_CONFIDENCE_DECAY_G);
+    }
+
     if (!m_have_dump_filter)
     {
         m_dump_filtered_x = x;
@@ -444,20 +459,6 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
     }
     else
     {
-        const float sample_mag =
-            sqrtf ((x * x) + (y * y) + (z * z));
-        const float sample_g =
-            sample_mag / m_upright_mag;
-        float confidence = 1.0F;
-
-        if (sample_g > CART_DUMP_CONFIDENCE_ONSET_G)
-        {
-            confidence =
-                expf (
-                    -(sample_g - CART_DUMP_CONFIDENCE_ONSET_G) /
-                    CART_DUMP_CONFIDENCE_DECAY_G);
-        }
-
         const float effective_alpha =
             m_dump_filter_alpha * confidence;
 
@@ -489,6 +490,10 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
 
     const bool inverted =
         cart_is_inverted (dump_angle_deg);
+
+    const bool dump_evidence =
+        inverted &&
+        (confidence >= CART_DUMP_MIN_HIT_CONFIDENCE);
 
     const bool upright =
         cart_is_upright (dump_angle_deg);
@@ -526,7 +531,7 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
     {
         if (!m_dump_candidate)
         {
-            if (inverted)
+            if (dump_evidence)
             {
                 cart_dump_candidate_start();
             }
@@ -535,7 +540,7 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
         {
             m_dump_candidate_samples++;
 
-            if (inverted)
+            if (dump_evidence)
             {
                 m_dump_candidate_hits++;
             }
@@ -570,7 +575,7 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
                      */
                     cart_dump_candidate_reset();
 
-                    if (inverted)
+                    if (dump_evidence)
                     {
                         cart_dump_candidate_start();
                     }
