@@ -74,6 +74,23 @@
 #define CART_DUMP_FILTER_TAU_MS     (280.0F)
 
 /*
+ * High-g samples are more likely to be dominated by impact / translational
+ * acceleration than gravity. Sample magnitude is normalized against the
+ * learned stationary upright magnitude, so 1.0 g reflects this tag's own
+ * measured baseline rather than a hard-coded standard-gravity constant.
+ * Leave samples at or below the onset threshold fully trusted, then
+ * exponentially reduce their influence on the DUMP EMA. Low-g samples remain
+ * fully trusted because representative dump events can legitimately contain
+ * brief low-g phases.
+ *
+ * confidence = 1.0                               , g <= onset
+ * confidence = exp(-(g - onset) / decay)         , g > onset
+ * effective_alpha = base_alpha * confidence
+ */
+#define CART_DUMP_CONFIDENCE_ONSET_G (1.8F)
+#define CART_DUMP_CONFIDENCE_DECAY_G (1.0F)
+
+/*
  * Consider the cart returned upright when its acceleration vector is at most
  * CART_UPRIGHT_ANGLE_DEG from the upright reference vector.
  */
@@ -115,6 +132,7 @@ static float m_previous_z;
 static float m_upright_x;
 static float m_upright_y;
 static float m_upright_z;
+static float m_upright_mag;
 
 static float m_dump_filtered_x;
 static float m_dump_filtered_y;
@@ -384,6 +402,8 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
         m_upright_x = x;
         m_upright_y = y;
         m_upright_z = z;
+        m_upright_mag =
+            sqrtf ((x * x) + (y * y) + (z * z));
         m_have_upright_sample = true;
     }
 
@@ -424,12 +444,29 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
     }
     else
     {
+        const float sample_mag =
+            sqrtf ((x * x) + (y * y) + (z * z));
+        const float sample_g =
+            sample_mag / m_upright_mag;
+        float confidence = 1.0F;
+
+        if (sample_g > CART_DUMP_CONFIDENCE_ONSET_G)
+        {
+            confidence =
+                expf (
+                    -(sample_g - CART_DUMP_CONFIDENCE_ONSET_G) /
+                    CART_DUMP_CONFIDENCE_DECAY_G);
+        }
+
+        const float effective_alpha =
+            m_dump_filter_alpha * confidence;
+
         m_dump_filtered_x +=
-            m_dump_filter_alpha * (x - m_dump_filtered_x);
+            effective_alpha * (x - m_dump_filtered_x);
         m_dump_filtered_y +=
-            m_dump_filter_alpha * (y - m_dump_filtered_y);
+            effective_alpha * (y - m_dump_filtered_y);
         m_dump_filtered_z +=
-            m_dump_filter_alpha * (z - m_dump_filtered_z);
+            effective_alpha * (z - m_dump_filtered_z);
     }
 
     const float angle_deg =
