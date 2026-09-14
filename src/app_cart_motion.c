@@ -21,16 +21,18 @@
 #define M_PI 3.14159265358979323846F
 #endif
 
-#define CART_MOTION_INTERVAL_MS     (100U)
-#define CART_DUMP_INTERVAL_MS       (100U)
+#define CART_ANALYSIS_INTERVAL_MS   (100U)
+#define CART_ACTIVE_ADV_INTERVAL_MS (50U)
 // #define CART_IDLE_INTERVAL_MS       (120U * 1000U)
 #define CART_IDLE_INTERVAL_MS       (10U * 1000U)
 #define CART_IDLE_TIMEOUT_MS        (5000U)
+#define CART_IDLE_ADV_SEND_COUNT    (3U)
+#define CART_IDLE_ADV_DRAIN_MS      (400U)
 
 #define CART_DUMP_CONFIRM_MS        (300U)
 #define CART_DUMP_CONFIRM_SAMPLES   (4U)
 #define CART_DUMP_REQUIRED_HITS     (3U)
-#define CART_DUMP_MIN_HOLD_MS       (15U * 1000U)
+#define CART_DUMP_ACTIVE_HOLD_MS    (15U * 1000U)
 
 /*
  * Consider the cart inverted when its acceleration vector is at least
@@ -47,7 +49,7 @@
  *
  *     alpha = 1 - exp(-sample_interval / CART_DUMP_FILTER_TAU_MS)
  *
- * With CART_MOTION_INTERVAL_MS = 100 ms and TAU = 280 ms:
+ * With CART_ANALYSIS_INTERVAL_MS = 100 ms and TAU = 280 ms:
  *
  *     alpha ~= 0.30
  *
@@ -92,10 +94,16 @@
 #define CART_DUMP_MIN_HIT_CONFIDENCE (0.75F)
 
 /*
- * Consider the cart returned upright when its acceleration vector is at most
+ * Allow a latched DUMP to re-arm once the filtered acceleration vector returns
+ * within CART_DUMP_REARM_ANGLE_DEG of the upright reference vector.
+ */
+#define CART_DUMP_REARM_ANGLE_DEG   (60.0F)
+
+/*
+ * Report the cart as upright when its filtered acceleration vector is at most
  * CART_UPRIGHT_ANGLE_DEG from the upright reference vector.
  */
-#define CART_UPRIGHT_ANGLE_DEG      (60.0F)
+#define CART_UPRIGHT_ANGLE_DEG      (25.0F)
 
 /*
  * Change in acceleration vector required to consider the cart still moving.
@@ -117,6 +125,7 @@
 #define CART_ROLLING_MAX_ANGLE_DEG    (75.0F)
 
 static ri_timer_id_t m_idle_timer;
+static bool m_idle_restore_pending;
 static bool m_active;
 static bool m_have_previous_sample;
 static bool m_have_upright_sample;
@@ -124,7 +133,6 @@ static bool m_have_dump_filter;
 static bool m_dump_candidate;
 static bool m_dump_latched;
 static bool m_dump_armed;
-static bool m_dump_fast;
 
 static float m_previous_x;
 static float m_previous_y;
@@ -148,6 +156,7 @@ static bool m_rolling_candidate;
 static bool m_rolling;
 static uint32_t m_rolling_evidence_ms;
 static uint64_t m_last_rolling_motion_ms;
+static app_cart_motion_telemetry_t m_telemetry;
 
 static float cart_angle_from_reference_deg (const float x,
                                             const float y,
@@ -193,6 +202,11 @@ static bool cart_is_inverted (const float angle_deg)
     return angle_deg >= CART_DUMP_ANGLE_DEG;
 }
 
+static bool cart_is_dump_rearmed (const float angle_deg)
+{
+    return angle_deg <= CART_DUMP_REARM_ANGLE_DEG;
+}
+
 static bool cart_is_upright (const float angle_deg)
 {
     return angle_deg <= CART_UPRIGHT_ANGLE_DEG;
@@ -220,6 +234,7 @@ static void cart_dump_candidate_start (void)
 
 static void cart_idle_timer_restart (void)
 {
+    m_idle_restore_pending = false;
     (void) ri_timer_stop (m_idle_timer);
     (void) ri_timer_start (m_idle_timer, CART_IDLE_TIMEOUT_MS, NULL);
 }
@@ -228,6 +243,14 @@ static void cart_idle (void * p_event, uint16_t event_size)
 {
     (void) p_event;
     (void) event_size;
+
+    if (m_idle_restore_pending)
+    {
+        m_idle_restore_pending = false;
+        app_comms_bleadv_send_count_set (APP_NUM_REPEATS);
+        app_comms_bleadv_interval_set (APP_BLE_INTERVAL_MS);
+        return;
+    }
 
     if (!m_active)
     {
@@ -260,7 +283,6 @@ static void cart_idle (void * p_event, uint16_t event_size)
         m_dump_latched = false;
         cart_dump_candidate_reset();
         m_dump_armed = true;
-        m_dump_fast = false;
     }
 
     /*
@@ -275,19 +297,30 @@ static void cart_idle (void * p_event, uint16_t event_size)
     m_rolling_evidence_ms = 0U;
 
     /*
-     * Send one final fresh sample while fast advertising is still active.
+     * Per-sample evidence must not remain asserted in the final idle packet.
+     * Upright remains the most recent analyzed orientation, consistent with
+     * the other derived telemetry values.
      */
+    m_telemetry.dump_evidence = false;
+    m_telemetry.rolling_evidence = false;
+
+    /*
+     * Repeat the final IDLE advertisements while the fast 50 ms advertising
+     * interval is still active. This gives both RAWv2 and F0 multiple chances
+     * to be received without adding another transition state or heartbeat.
+     */
+    app_comms_bleadv_send_count_set (CART_IDLE_ADV_SEND_COUNT);
     app_heartbeat_now();
 
     /*
-     * Return to low-power idle telemetry.
-     *
-     * Generate a fresh sample at CART_IDLE_INTERVAL_MS and retain the stock
-     * two-advertisement delivery behavior for each sample.
+     * Return the heartbeat to low-power idle telemetry immediately, but leave
+     * the advertiser at the active 50 ms interval long enough for the repeated
+     * RAWv2 + F0 packets above to drain before restoring the stock advertising
+     * configuration.
      */
-    app_comms_bleadv_send_count_set (APP_NUM_REPEATS);
-    app_comms_bleadv_interval_set (APP_BLE_INTERVAL_MS);
     (void) app_heartbeat_interval_set (CART_IDLE_INTERVAL_MS);
+    m_idle_restore_pending = true;
+    (void) ri_timer_start (m_idle_timer, CART_IDLE_ADV_DRAIN_MS, NULL);
 }
 
 static void cart_idle_timeout_isr (void * const p_context)
@@ -301,17 +334,17 @@ static void cart_motion (void * p_event, uint16_t event_size)
     (void) p_event;
     (void) event_size;
 
-    m_last_motion_ms = ri_rtc_millis();
-    cart_idle_timer_restart();
-
     if (!m_active)
     {
+        m_last_motion_ms = ri_rtc_millis();
+        cart_idle_timer_restart();
+
         /*
          * Enter active telemetry mode.
          */
         app_comms_bleadv_send_count_set (1U);
-        app_comms_bleadv_interval_set (CART_MOTION_INTERVAL_MS);
-        (void) app_heartbeat_interval_set (CART_MOTION_INTERVAL_MS);
+        app_comms_bleadv_interval_set (CART_ACTIVE_ADV_INTERVAL_MS);
+        (void) app_heartbeat_interval_set (CART_ANALYSIS_INTERVAL_MS);
 
         m_active = true;
         m_have_previous_sample = false;
@@ -319,7 +352,7 @@ static void cart_motion (void * p_event, uint16_t event_size)
 
         /*
          * Generate fresh telemetry immediately rather than waiting for the
-         * first CART_MOTION_INTERVAL_MS heartbeat timer expiration.
+         * first CART_ANALYSIS_INTERVAL_MS heartbeat timer expiration.
          */
         app_heartbeat_now();
     }
@@ -335,6 +368,7 @@ rd_status_t app_cart_motion_init (void)
     }
     else
     {
+        m_idle_restore_pending = false;
         m_active = false;
         m_have_previous_sample = false;
         m_have_upright_sample = false;
@@ -343,7 +377,6 @@ rd_status_t app_cart_motion_init (void)
         cart_dump_candidate_reset();
         m_dump_latched = false;
         m_dump_armed = true;
-        m_dump_fast = false;
 
         m_last_motion_ms = 0U;
         m_dump_min_hold_until_ms = 0U;
@@ -352,10 +385,11 @@ rd_status_t app_cart_motion_init (void)
 
         m_rolling_evidence_ms = 0U;
         m_last_rolling_motion_ms = 0U;
+        m_telemetry = (app_cart_motion_telemetry_t) {0};
 
         m_dump_filter_alpha =
             1.0F - expf (
-                -((float) CART_MOTION_INTERVAL_MS) /
+                -((float) CART_ANALYSIS_INTERVAL_MS) /
                 CART_DUMP_FILTER_TAU_MS);
 
         err_code |= ri_timer_create (&m_idle_timer,
@@ -424,10 +458,7 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
      * interval while cart active mode is already running.
      */
     app_comms_bleadv_send_count_set (1U);
-    app_comms_bleadv_interval_set (
-        m_dump_fast
-            ? CART_DUMP_INTERVAL_MS
-            : CART_MOTION_INTERVAL_MS);
+    app_comms_bleadv_interval_set (CART_ACTIVE_ADV_INTERVAL_MS);
 
     const uint64_t now_ms = ri_rtc_millis();
 
@@ -495,33 +526,28 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
         inverted &&
         (confidence >= CART_DUMP_MIN_HIT_CONFIDENCE);
 
+    const bool dump_rearmed =
+        cart_is_dump_rearmed (dump_angle_deg);
+
     const bool upright =
         cart_is_upright (dump_angle_deg);
 
     const bool rolling =
         cart_is_rolling (angle_deg);
 
-    /*
-     * Use CART_DUMP_INTERVAL_MS telemetry only to protect delivery of the dump
-     * event. After the minimum hold interval, return to CART_MOTION_INTERVAL_MS
-     * even if the dump status remains asserted.
-     */
-    if (m_dump_fast && (now_ms >= m_dump_min_hold_until_ms))
-    {
-        m_dump_fast = false;
-
-        app_comms_bleadv_interval_set (CART_MOTION_INTERVAL_MS);
-        (void) app_heartbeat_interval_set (CART_MOTION_INTERVAL_MS);
-    }
+    bool rolling_evidence = false;
 
     if (m_dump_latched)
     {
         /*
-         * The dump status is asserted for at least CART_DUMP_MIN_HOLD_MS.
-         * After that minimum interval, clear it only after the cart has
-         * physically returned close to its normal upright orientation.
+         * While the cart remains active, keep DUMP latched for
+         * CART_DUMP_ACTIVE_HOLD_MS. After that interval, clear it only once the cart
+         * has returned close to its normal upright orientation.
+         *
+         * The idle timeout may clear a stale DUMP sooner if the cart has been
+         * completely quiet for CART_IDLE_TIMEOUT_MS.
          */
-        if ( (now_ms >= m_dump_min_hold_until_ms) && upright)
+        if ( (now_ms >= m_dump_min_hold_until_ms) && dump_rearmed)
         {
             m_dump_latched = false;
             m_dump_armed = true;
@@ -552,13 +578,9 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
                     cart_dump_candidate_reset();
                     m_dump_latched = true;
                     m_dump_armed = false;
-                    m_dump_fast = true;
                     m_dump_min_hold_until_ms =
-                        now_ms + CART_DUMP_MIN_HOLD_MS;
+                        now_ms + CART_DUMP_ACTIVE_HOLD_MS;
                     app_comms_bleadv_send_count_set (1U);
-                    app_comms_bleadv_interval_set (CART_DUMP_INTERVAL_MS);
-                    (void) app_heartbeat_interval_set (
-                               CART_DUMP_INTERVAL_MS);
 
                     /*
                      * Keep non-idle telemetry running while dump status is
@@ -594,7 +616,7 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
         const bool sample_moving =
             delta_g2 >= CART_SAMPLE_MOTION_G2;
 
-        const bool rolling_motion =
+        rolling_evidence =
             sample_moving && rolling;
 
         if (sample_moving)
@@ -603,7 +625,7 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
             cart_idle_timer_restart();
         }
 
-        if (rolling_motion)
+        if (rolling_evidence)
         {
             /*
              * A gap longer than CART_ROLLING_GAP_TOLERANCE_MS starts a new
@@ -624,7 +646,7 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
             }
             if (m_rolling_candidate)
             {
-                m_rolling_evidence_ms += CART_MOTION_INTERVAL_MS;
+                m_rolling_evidence_ms += CART_ANALYSIS_INTERVAL_MS;
 
                 if (m_rolling_evidence_ms >= CART_ROLLING_CONFIRM_MS)
                 {
@@ -654,6 +676,23 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
         cart_idle_timer_restart();
     }
 
+    m_telemetry.valid = true;
+    m_telemetry.active = m_active;
+    m_telemetry.dump_candidate = m_dump_candidate;
+    m_telemetry.dump_evidence = dump_evidence;
+    m_telemetry.dump_latched = m_dump_latched;
+    m_telemetry.rolling_candidate = m_rolling_candidate;
+    m_telemetry.rolling_evidence = rolling_evidence;
+    m_telemetry.upright = upright;
+    m_telemetry.status = app_cart_motion_status_get();
+    m_telemetry.dump_candidate_hits = m_dump_candidate_hits;
+    m_telemetry.dump_candidate_samples = m_dump_candidate_samples;
+    m_telemetry.rolling_evidence_ms = m_rolling_evidence_ms;
+    m_telemetry.raw_angle_deg = angle_deg;
+    m_telemetry.filtered_angle_deg = dump_angle_deg;
+    m_telemetry.sample_g = sample_g;
+    m_telemetry.confidence = confidence;
+
     m_previous_x = x;
     m_previous_y = y;
     m_previous_z = z;
@@ -672,4 +711,29 @@ uint8_t app_cart_motion_status_get (void)
     }
 
     return APP_CART_STATUS_NORMAL;
+}
+
+bool app_cart_motion_active_get (void)
+{
+    return m_active;
+}
+
+bool app_cart_motion_telemetry_get (
+    app_cart_motion_telemetry_t * const p_telemetry)
+{
+    if (NULL == p_telemetry)
+    {
+        return false;
+    }
+
+    *p_telemetry = m_telemetry;
+    p_telemetry->active = m_active;
+    p_telemetry->dump_candidate = m_dump_candidate;
+    p_telemetry->dump_latched = m_dump_latched;
+    p_telemetry->rolling_candidate = m_rolling_candidate;
+    p_telemetry->status = app_cart_motion_status_get();
+    p_telemetry->dump_candidate_hits = m_dump_candidate_hits;
+    p_telemetry->dump_candidate_samples = m_dump_candidate_samples;
+    p_telemetry->rolling_evidence_ms = m_rolling_evidence_ms;
+    return m_telemetry.valid;
 }

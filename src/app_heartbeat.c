@@ -33,6 +33,10 @@
 #define APP_DF_8_ENABLED 0
 #define APP_DF_FA_ENABLED 0
 
+rd_status_t app_dataformat_encode_dumpsense (
+    uint8_t * const output,
+    size_t * const output_length);
+
 static ri_timer_id_t heart_timer; //!< Timer for updating data.
 
 static uint32_t heart_interval_ms = APP_HEARTBEAT_INTERVAL_MS;
@@ -97,10 +101,12 @@ static
 void heartbeat (void * p_event, uint16_t event_size)
 {
     ri_comm_message_t msg = {0};
+    ri_comm_message_t dumpsense_msg = {0};
     rd_status_t err_code = RD_SUCCESS;
     bool heartbeat_ok = false;
     rd_sensor_data_t data = { 0 };
     size_t buffer_len = RI_COMM_MESSAGE_MAX_LENGTH;
+    size_t dumpsense_buffer_len = RI_COMM_MESSAGE_MAX_LENGTH;
     data.fields = app_sensor_available_data();
     float data_values[rd_sensor_data_fieldcount (&data)];
     data.data = data_values;
@@ -118,6 +124,39 @@ void heartbeat (void * p_event, uint16_t event_size)
     if (RD_SUCCESS == err_code)
     {
         heartbeat_ok = true;
+    }
+
+    /*
+     * Always publish a paired unofficial 0xF0 DumpSense packet from the same
+     * analyzed sample as RAWv2.
+     *
+     * Active mode: both formats are queued every 100 ms analysis heartbeat;
+     * the advertiser runs at 50 ms so both packets can drain in that period.
+     *
+     * Idle mode: both formats follow the normal 10 s heartbeat cadence.
+     * cart_idle() already clears m_active and forces one final heartbeat before
+     * restoring slow idle timing, so the transition to IDLE is published
+     * immediately without any additional transition state.
+     *
+     * Keep this in a separate message so existing GATT/NFC behavior below
+     * continues to use the normal RAWv2 payload.
+     */
+    {
+        err_code = app_dataformat_encode_dumpsense (
+                       dumpsense_msg.data,
+                       &dumpsense_buffer_len);
+        RD_ERROR_CHECK (err_code, ~RD_ERROR_FATAL);
+
+        if (RD_SUCCESS == err_code)
+        {
+            dumpsense_msg.data_length = (uint8_t) dumpsense_buffer_len;
+            err_code = send_adv (&dumpsense_msg);
+            RD_ERROR_CHECK (err_code, ~RD_ERROR_FATAL);
+            if (RD_SUCCESS == err_code)
+            {
+                heartbeat_ok = true;
+            }
+        }
     }
 
     // Cut endpoint data to fit into GATT msg.

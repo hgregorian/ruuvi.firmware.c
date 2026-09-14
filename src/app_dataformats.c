@@ -53,6 +53,8 @@ uint32_t app_data_encrypt (const uint8_t * const cleartext,
 }
 #endif
 
+static uint16_t ep_5_measurement_count;
+
 app_dataformat_t app_dataformat_next (const app_dataformats_t formats,
                                       const app_dataformat_t state)
 {
@@ -94,7 +96,6 @@ encode_to_5 (uint8_t * const output,
              size_t * const output_length,
              const rd_sensor_data_t * const data)
 {
-    static uint16_t ep_5_measurement_count = 0;
     rd_status_t err_code = RD_SUCCESS;
     re_status_t enc_code = RE_SUCCESS;
     re_5_data_t ep_data = {0};
@@ -284,4 +285,179 @@ rd_status_t app_dataformat_encode (uint8_t * const output,
     }
 
     return err_code;
+}
+
+
+#define DUMPSENSE_FORMAT_ID          (0xF0U)
+#define DUMPSENSE_SCHEMA_VERSION     (0x01U)
+#define DUMPSENSE_DATA_LENGTH        (24U)
+#define DUMPSENSE_ANGLE_SCALE        (100.0F)
+#define DUMPSENSE_G_SCALE            (1000.0F)
+#define DUMPSENSE_CONFIDENCE_SCALE   (255.0F)
+#define DUMPSENSE_ROLLING_TICK_MS    (100U)
+
+#define DUMPSENSE_FLAG_DUMP_CANDIDATE    (1U << 2U)
+#define DUMPSENSE_FLAG_DUMP_EVIDENCE     (1U << 3U)
+#define DUMPSENSE_FLAG_DUMP_LATCHED      (1U << 4U)
+#define DUMPSENSE_FLAG_ROLLING_CANDIDATE (1U << 5U)
+#define DUMPSENSE_FLAG_ROLLING_EVIDENCE  (1U << 6U)
+#define DUMPSENSE_FLAG_UPRIGHT           (1U << 7U)
+
+static void dumpsense_put_u16_be (
+    uint8_t * const output,
+    const size_t offset,
+    const uint16_t value)
+{
+    output[offset] = (uint8_t) ((value >> 8U) & 0xFFU);
+    output[offset + 1U] = (uint8_t) (value & 0xFFU);
+}
+
+static uint16_t dumpsense_u16_from_float (
+    const float value,
+    const float scale)
+{
+    if ((!isfinite (value)) || (value <= 0.0F))
+    {
+        return 0U;
+    }
+
+    const float scaled = value * scale;
+    if (scaled >= 65535.0F)
+    {
+        return 65535U;
+    }
+
+    return (uint16_t) lroundf (scaled);
+}
+
+uint16_t app_dataformat_rawv2_sequence_get (void)
+{
+    return ep_5_measurement_count;
+}
+
+rd_status_t app_dataformat_encode_dumpsense (
+    uint8_t * const output,
+    size_t * const output_length)
+{
+    if ((NULL == output) || (NULL == output_length) ||
+        (*output_length < DUMPSENSE_DATA_LENGTH))
+    {
+        return RD_ERROR_INVALID_PARAM;
+    }
+
+    app_cart_motion_telemetry_t telemetry = {0};
+    (void) app_cart_motion_telemetry_get (&telemetry);
+
+    memset (output, 0xFF, DUMPSENSE_DATA_LENGTH);
+
+    output[0] = DUMPSENSE_FORMAT_ID;
+    output[1] = DUMPSENSE_SCHEMA_VERSION;
+
+    /*
+     * Bytes 2..3: paired RAWv2 measurement sequence.
+     *
+     * heartbeat() encodes RAWv2 first, which advances the RAWv2 measurement
+     * sequence, then encodes this F0 packet from the same already-analyzed
+     * 100 ms sample. Both packets therefore share this sequence identifier.
+     */
+    dumpsense_put_u16_be (
+        output,
+        2U,
+        app_dataformat_rawv2_sequence_get());
+
+    dumpsense_put_u16_be (
+        output,
+        4U,
+        dumpsense_u16_from_float (
+            telemetry.raw_angle_deg,
+            DUMPSENSE_ANGLE_SCALE));
+
+    dumpsense_put_u16_be (
+        output,
+        6U,
+        dumpsense_u16_from_float (
+            telemetry.filtered_angle_deg,
+            DUMPSENSE_ANGLE_SCALE));
+
+    dumpsense_put_u16_be (
+        output,
+        8U,
+        dumpsense_u16_from_float (
+            telemetry.sample_g,
+            DUMPSENSE_G_SCALE));
+
+    uint8_t confidence_q8 = 0U;
+    if (isfinite (telemetry.confidence) && (telemetry.confidence > 0.0F))
+    {
+        const float q =
+            telemetry.confidence * DUMPSENSE_CONFIDENCE_SCALE;
+        confidence_q8 =
+            (uint8_t) ((q >= 255.0F) ? 255U : lroundf (q));
+    }
+    output[10] = confidence_q8;
+
+    uint8_t operational_state = 0U;
+
+    if (telemetry.dump_latched)
+    {
+        operational_state = 3U; /* DUMP */
+    }
+    else if (telemetry.status == APP_CART_STATUS_ROLLING)
+    {
+        operational_state = 2U; /* ROLLING */
+    }
+    else if (telemetry.active)
+    {
+        operational_state = 1U; /* ACTIVE / HANDLING */
+    }
+    else
+    {
+        operational_state = 0U; /* IDLE */
+    }
+
+    uint8_t state_flags = operational_state & 0x03U;
+
+    if (telemetry.dump_candidate)
+    {
+        state_flags |= DUMPSENSE_FLAG_DUMP_CANDIDATE;
+    }
+    if (telemetry.dump_evidence)
+    {
+        state_flags |= DUMPSENSE_FLAG_DUMP_EVIDENCE;
+    }
+    if (telemetry.dump_latched)
+    {
+        state_flags |= DUMPSENSE_FLAG_DUMP_LATCHED;
+    }
+    if (telemetry.rolling_candidate)
+    {
+        state_flags |= DUMPSENSE_FLAG_ROLLING_CANDIDATE;
+    }
+    if (telemetry.rolling_evidence)
+    {
+        state_flags |= DUMPSENSE_FLAG_ROLLING_EVIDENCE;
+    }
+    if (telemetry.upright)
+    {
+        state_flags |= DUMPSENSE_FLAG_UPRIGHT;
+    }
+    output[11] = state_flags;
+
+    output[12] = telemetry.dump_candidate_hits;
+    output[13] = telemetry.dump_candidate_samples;
+
+    uint32_t rolling_ticks =
+        telemetry.rolling_evidence_ms / DUMPSENSE_ROLLING_TICK_MS;
+    if (rolling_ticks > 65535U)
+    {
+        rolling_ticks = 65535U;
+    }
+    dumpsense_put_u16_be (output, 14U, (uint16_t) rolling_ticks);
+
+    /*
+     * Bytes 16..23 reserved as 0xFF for future derived telemetry.
+     * Do not put raw X/Y/Z here; RAWv2 is intentionally authoritative.
+     */
+    *output_length = DUMPSENSE_DATA_LENGTH;
+    return RD_SUCCESS;
 }
