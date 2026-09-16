@@ -103,7 +103,7 @@
  * Report the cart as upright when its filtered acceleration vector is at most
  * CART_UPRIGHT_ANGLE_DEG from the upright reference vector.
  */
-#define CART_UPRIGHT_ANGLE_DEG      (25.0F)
+#define CART_UPRIGHT_ANGLE_DEG      (15.0F)
 
 /*
  * Change in acceleration vector required to consider the cart still moving.
