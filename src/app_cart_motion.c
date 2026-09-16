@@ -10,6 +10,7 @@
 #include "app_config.h"
 #include "app_heartbeat.h"
 #include "ruuvi_boards.h"
+#include "ruuvi_task_advertisement.h"
 #include "ruuvi_interface_rtc.h"
 #include "ruuvi_interface_scheduler.h"
 #include "ruuvi_interface_timer.h"
@@ -338,6 +339,14 @@ static void cart_motion (void * p_event, uint16_t event_size)
     {
         m_last_motion_ms = ri_rtc_millis();
         cart_idle_timer_restart();
+
+        /*
+         * Discard any slow IDLE advertisement still in progress or queued.
+         * ACTIVE telemetry supersedes stale IDLE telemetry, and allowing the
+         * old 1285 ms advertisements to drain can fill the small advertising
+         * queue before the 50 ms ACTIVE stream takes over.
+         */
+        (void) rt_adv_stop();
 
         /*
          * Enter active telemetry mode.
