@@ -303,6 +303,70 @@ rd_status_t app_dataformat_encode (uint8_t * const output,
 #define DUMPSENSE_FLAG_ROLLING_EVIDENCE  (1U << 6U)
 #define DUMPSENSE_FLAG_UPRIGHT           (1U << 7U)
 
+static uint8_t m_raw_adv_nomem_count;
+static uint8_t m_f0_adv_nomem_count;
+static uint8_t m_raw_adv_other_error_count;
+static uint8_t m_f0_adv_other_error_count;
+static uint16_t m_raw_adv_last_fail_sequence = 0xFFFFU;
+static uint16_t m_f0_adv_last_fail_sequence = 0xFFFFU;
+
+static void dumpsense_adv_diag_count_increment (uint8_t * const p_count)
+{
+    if (*p_count < 0xFFU)
+    {
+        (*p_count)++;
+    }
+}
+
+static void dumpsense_adv_diag_record (
+    const rd_status_t err_code,
+    const uint16_t sequence,
+    uint8_t * const p_nomem_count,
+    uint8_t * const p_other_error_count,
+    uint16_t * const p_last_fail_sequence)
+{
+    if (RD_SUCCESS == err_code)
+    {
+        return;
+    }
+
+    if (0U != (err_code & RD_ERROR_NO_MEM))
+    {
+        dumpsense_adv_diag_count_increment (p_nomem_count);
+    }
+
+    if (0U != (err_code & ~RD_ERROR_NO_MEM))
+    {
+        dumpsense_adv_diag_count_increment (p_other_error_count);
+    }
+
+    *p_last_fail_sequence = sequence;
+}
+
+void app_dataformat_adv_diag_record_raw (
+    const rd_status_t err_code,
+    const uint16_t sequence)
+{
+    dumpsense_adv_diag_record (
+        err_code,
+        sequence,
+        &m_raw_adv_nomem_count,
+        &m_raw_adv_other_error_count,
+        &m_raw_adv_last_fail_sequence);
+}
+
+void app_dataformat_adv_diag_record_f0 (
+    const rd_status_t err_code,
+    const uint16_t sequence)
+{
+    dumpsense_adv_diag_record (
+        err_code,
+        sequence,
+        &m_f0_adv_nomem_count,
+        &m_f0_adv_other_error_count,
+        &m_f0_adv_last_fail_sequence);
+}
+
 static void dumpsense_put_u16_be (
     uint8_t * const output,
     const size_t offset,
@@ -455,9 +519,25 @@ rd_status_t app_dataformat_encode_dumpsense (
     dumpsense_put_u16_be (output, 14U, (uint16_t) rolling_ticks);
 
     /*
-     * Bytes 16..23 reserved as 0xFF for future derived telemetry.
-     * Do not put raw X/Y/Z here; RAWv2 is intentionally authoritative.
+     * Bytes 16..23: advertising queue diagnostics.
+     *
+     *   16      RAWv2 RD_ERROR_NO_MEM count
+     *   17      F0 RD_ERROR_NO_MEM count
+     *   18      RAWv2 other advertising error count
+     *   19      F0 other advertising error count
+     *   20..21  Last RAWv2 advertising failure sequence
+     *   22..23  Last F0 advertising failure sequence
+     *
+     * Counts saturate at 255. A last-failure sequence of 0xFFFF means that
+     * format has not had an advertising send failure since boot.
      */
+    output[16] = m_raw_adv_nomem_count;
+    output[17] = m_f0_adv_nomem_count;
+    output[18] = m_raw_adv_other_error_count;
+    output[19] = m_f0_adv_other_error_count;
+    dumpsense_put_u16_be (output, 20U, m_raw_adv_last_fail_sequence);
+    dumpsense_put_u16_be (output, 22U, m_f0_adv_last_fail_sequence);
+
     *output_length = DUMPSENSE_DATA_LENGTH;
     return RD_SUCCESS;
 }

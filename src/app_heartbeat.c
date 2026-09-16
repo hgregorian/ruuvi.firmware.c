@@ -36,6 +36,13 @@
 rd_status_t app_dataformat_encode_dumpsense (
     uint8_t * const output,
     size_t * const output_length);
+uint16_t app_dataformat_rawv2_sequence_get (void);
+void app_dataformat_adv_diag_record_raw (
+    const rd_status_t err_code,
+    const uint16_t sequence);
+void app_dataformat_adv_diag_record_f0 (
+    const rd_status_t err_code,
+    const uint16_t sequence);
 
 static ri_timer_id_t heart_timer; //!< Timer for updating data.
 
@@ -117,7 +124,9 @@ void heartbeat (void * p_event, uint16_t event_size)
     m_dataformat_state = app_dataformat_next (m_dataformats_enabled, m_dataformat_state);
     app_dataformat_encode (msg.data, &buffer_len, &data, m_dataformat_state);
     msg.data_length = (uint8_t) buffer_len;
+    const uint16_t rawv2_sequence = app_dataformat_rawv2_sequence_get();
     err_code = send_adv (&msg);
+    app_dataformat_adv_diag_record_raw (err_code, rawv2_sequence);
     // Advertising should always be successful
     RD_ERROR_CHECK (err_code, ~RD_ERROR_FATAL);
 
@@ -151,6 +160,7 @@ void heartbeat (void * p_event, uint16_t event_size)
         {
             dumpsense_msg.data_length = (uint8_t) dumpsense_buffer_len;
             err_code = send_adv (&dumpsense_msg);
+            app_dataformat_adv_diag_record_f0 (err_code, rawv2_sequence);
             RD_ERROR_CHECK (err_code, ~RD_ERROR_FATAL);
             if (RD_SUCCESS == err_code)
             {
