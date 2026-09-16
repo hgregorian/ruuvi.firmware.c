@@ -27,8 +27,8 @@
 // #define CART_IDLE_INTERVAL_MS       (120U * 1000U)
 #define CART_IDLE_INTERVAL_MS       (10U * 1000U)
 #define CART_IDLE_TIMEOUT_MS        (5000U)
-#define CART_IDLE_ADV_SEND_COUNT    (3U)
-#define CART_IDLE_ADV_DRAIN_MS      (400U)
+#define CART_IDLE_TRANSITION_INTERVAL_MS (250U)
+#define CART_IDLE_TRANSITION_DURATION_MS (2200U)
 
 #define CART_DUMP_CONFIRM_MS        (300U)
 #define CART_DUMP_CONFIRM_SAMPLES   (4U)
@@ -250,6 +250,7 @@ static void cart_idle (void * p_event, uint16_t event_size)
         m_idle_restore_pending = false;
         app_comms_bleadv_send_count_set (APP_NUM_REPEATS);
         app_comms_bleadv_interval_set (APP_BLE_INTERVAL_MS);
+        (void) app_heartbeat_interval_set (CART_IDLE_INTERVAL_MS);
         return;
     }
 
@@ -306,22 +307,21 @@ static void cart_idle (void * p_event, uint16_t event_size)
     m_telemetry.rolling_evidence = false;
 
     /*
-     * Repeat the final IDLE advertisements while the fast 50 ms advertising
-     * interval is still active. This gives both RAWv2 and F0 multiple chances
-     * to be received without adding another transition state or heartbeat.
+     * Keep the fast 50 ms advertiser active and publish several distinct IDLE
+     * heartbeats over a short transition window. Spreading fresh RAWv2 + F0
+     * pairs across time gives receivers multiple independent opportunities to
+     * observe the ACTIVE -> IDLE state change.
      */
-    app_comms_bleadv_send_count_set (CART_IDLE_ADV_SEND_COUNT);
+    app_comms_bleadv_send_count_set (1U);
+    (void) app_heartbeat_interval_set (CART_IDLE_TRANSITION_INTERVAL_MS);
     app_heartbeat_now();
 
     /*
-     * Return the heartbeat to low-power idle telemetry immediately, but leave
-     * the advertiser at the active 50 ms interval long enough for the repeated
-     * RAWv2 + F0 packets above to drain before restoring the stock advertising
-     * configuration.
+     * After the transition burst has had time to run, restore the normal slow
+     * idle advertising configuration and 10 s heartbeat cadence.
      */
-    (void) app_heartbeat_interval_set (CART_IDLE_INTERVAL_MS);
     m_idle_restore_pending = true;
-    (void) ri_timer_start (m_idle_timer, CART_IDLE_ADV_DRAIN_MS, NULL);
+    (void) ri_timer_start (m_idle_timer, CART_IDLE_TRANSITION_DURATION_MS, NULL);
 }
 
 static void cart_idle_timeout_isr (void * const p_context)
