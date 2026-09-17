@@ -200,6 +200,39 @@ static float cart_angle_from_reference_deg (const float x,
     return acosf (cosine) * (180.0F / M_PI);
 }
 
+static void cart_sample_metrics_get (const float x,
+                                     const float y,
+                                     const float z,
+                                     float * const p_sample_g,
+                                     float * const p_confidence,
+                                     float * const p_angle_deg)
+{
+    const float sample_mag =
+        sqrtf ((x * x) + (y * y) + (z * z));
+
+    *p_sample_g =
+        sample_mag / m_upright_mag;
+
+    *p_confidence = 1.0F;
+
+    if (*p_sample_g > CART_DUMP_CONFIDENCE_ONSET_G)
+    {
+        *p_confidence =
+            expf (
+                -(*p_sample_g - CART_DUMP_CONFIDENCE_ONSET_G) /
+                CART_DUMP_CONFIDENCE_DECAY_G);
+    }
+
+    *p_angle_deg =
+        cart_angle_from_reference_deg (
+            x,
+            y,
+            z,
+            m_upright_x,
+            m_upright_y,
+            m_upright_z);
+}
+
 static bool cart_is_inverted (const float angle_deg)
 {
     return angle_deg >= CART_DUMP_ANGLE_DEG;
@@ -504,28 +537,17 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
     {
         if (!m_telemetry.valid)
         {
-            const float sample_mag =
-                sqrtf ((x * x) + (y * y) + (z * z));
-            const float sample_g =
-                sample_mag / m_upright_mag;
-            float confidence = 1.0F;
+            float sample_g;
+            float confidence;
+            float angle_deg;
 
-            if (sample_g > CART_DUMP_CONFIDENCE_ONSET_G)
-            {
-                confidence =
-                    expf (
-                        -(sample_g - CART_DUMP_CONFIDENCE_ONSET_G) /
-                        CART_DUMP_CONFIDENCE_DECAY_G);
-            }
-
-            const float angle_deg =
-                cart_angle_from_reference_deg (
-                    x,
-                    y,
-                    z,
-                    m_upright_x,
-                    m_upright_y,
-                    m_upright_z);
+            cart_sample_metrics_get (
+                x,
+                y,
+                z,
+                &sample_g,
+                &confidence,
+                &angle_deg);
 
             m_telemetry.valid = true;
             m_telemetry.active = false;
@@ -563,19 +585,17 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
      * short wheel impacts and vibration cannot dominate the gravity estimate.
      * ROLLING and sample-to-sample motion continue to use the raw XYZ values.
      */
-    const float sample_mag =
-        sqrtf ((x * x) + (y * y) + (z * z));
-    const float sample_g =
-        sample_mag / m_upright_mag;
-    float confidence = 1.0F;
+    float sample_g;
+    float confidence;
+    float angle_deg;
 
-    if (sample_g > CART_DUMP_CONFIDENCE_ONSET_G)
-    {
-        confidence =
-            expf (
-                -(sample_g - CART_DUMP_CONFIDENCE_ONSET_G) /
-                CART_DUMP_CONFIDENCE_DECAY_G);
-    }
+    cart_sample_metrics_get (
+        x,
+        y,
+        z,
+        &sample_g,
+        &confidence,
+        &angle_deg);
 
     if (!m_have_dump_filter)
     {
@@ -596,15 +616,6 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
         m_dump_filtered_z +=
             effective_alpha * (z - m_dump_filtered_z);
     }
-
-    const float angle_deg =
-        cart_angle_from_reference_deg (
-            x,
-            y,
-            z,
-            m_upright_x,
-            m_upright_y,
-            m_upright_z);
 
     const float dump_angle_deg =
         cart_angle_from_reference_deg (
