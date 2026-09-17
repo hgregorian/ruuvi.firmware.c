@@ -444,6 +444,8 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
         return;
     }
 
+    const bool had_upright_sample = m_have_upright_sample;
+
     /*
      * This lets the stationary startup heartbeat following a reboot establish
      * the permanent upright reference before active motion processing begins.
@@ -461,12 +463,56 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
     }
 
     /*
-     * Idle/startup samples may establish the permanent upright reference, but
-     * all DUMP, ROLLING, and active-telemetry processing remains gated by
-     * m_active.
+     * The first startup sample establishes the permanent upright reference.
+     * A later real idle sample may initialize passive telemetry once, but all
+     * DUMP, ROLLING, and motion-state processing remains gated by m_active.
      */
     if (!m_active)
     {
+        if ((!had_upright_sample) || m_telemetry.valid)
+        {
+            return;
+        }
+
+        const float sample_mag =
+            sqrtf ((x * x) + (y * y) + (z * z));
+        const float sample_g =
+            sample_mag / m_upright_mag;
+        float confidence = 1.0F;
+
+        if (sample_g > CART_DUMP_CONFIDENCE_ONSET_G)
+        {
+            confidence =
+                expf (
+                    -(sample_g - CART_DUMP_CONFIDENCE_ONSET_G) /
+                    CART_DUMP_CONFIDENCE_DECAY_G);
+        }
+
+        const float angle_deg =
+            cart_angle_from_reference_deg (
+                x,
+                y,
+                z,
+                m_upright_x,
+                m_upright_y,
+                m_upright_z);
+
+        m_telemetry.valid = true;
+        m_telemetry.active = false;
+        m_telemetry.dump_candidate = m_dump_candidate;
+        m_telemetry.dump_evidence = false;
+        m_telemetry.dump_latched = m_dump_latched;
+        m_telemetry.rolling_candidate = m_rolling_candidate;
+        m_telemetry.rolling_evidence = false;
+        m_telemetry.upright = cart_is_upright (angle_deg);
+        m_telemetry.status = app_cart_motion_status_get();
+        m_telemetry.dump_candidate_hits = m_dump_candidate_hits;
+        m_telemetry.dump_candidate_samples = m_dump_candidate_samples;
+        m_telemetry.rolling_evidence_ms = m_rolling_evidence_ms;
+        m_telemetry.raw_angle_deg = angle_deg;
+        m_telemetry.filtered_angle_deg = angle_deg;
+        m_telemetry.sample_g = sample_g;
+        m_telemetry.confidence = confidence;
         return;
     }
 
