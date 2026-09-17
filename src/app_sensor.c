@@ -495,11 +495,11 @@ rd_status_t app_sensor_acc_thr_set (float * const threshold_g)
     }
     else
     {
+        err_code |= provider->level_interrupt_set (true, threshold_g);
         err_code |= ri_gpio_interrupt_enable (RB_INT_LEVEL_PIN,
                                               RI_GPIO_SLOPE_TOGGLE,
                                               RI_GPIO_MODE_INPUT_NOPULL,
                                               &on_accelerometer_isr);
-        err_code |= provider->level_interrupt_set (true, threshold_g);
     }
 
     return err_code;
