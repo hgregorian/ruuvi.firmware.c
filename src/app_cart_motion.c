@@ -29,6 +29,7 @@
 #define CART_IDLE_TIMEOUT_MS        (5000U)
 #define CART_IDLE_TRANSITION_INTERVAL_MS (250U)
 #define CART_IDLE_TRANSITION_DURATION_MS (2200U)
+#define CART_STARTUP_MOTION_GUARD_MS (1000U)
 
 #define CART_DUMP_CONFIRM_MS        (300U)
 #define CART_DUMP_CONFIRM_SAMPLES   (4U)
@@ -150,6 +151,7 @@ static float m_dump_filtered_z;
 static float m_dump_filter_alpha;
 
 static uint64_t m_last_motion_ms;
+static uint64_t m_motion_guard_until_ms;
 static uint8_t m_dump_candidate_samples;
 static uint8_t m_dump_candidate_hits;
 static uint64_t m_dump_min_hold_until_ms;
@@ -335,6 +337,11 @@ static void cart_motion (void * p_event, uint16_t event_size)
     (void) p_event;
     (void) event_size;
 
+    if (ri_rtc_millis() < m_motion_guard_until_ms)
+    {
+        return;
+    }
+
     if (!m_active)
     {
         m_last_motion_ms = ri_rtc_millis();
@@ -388,6 +395,7 @@ rd_status_t app_cart_motion_init (void)
         m_dump_armed = true;
 
         m_last_motion_ms = 0U;
+        m_motion_guard_until_ms = 0U;
         m_dump_min_hold_until_ms = 0U;
         m_rolling_candidate = false;
         m_rolling = false;
@@ -449,6 +457,8 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
         m_upright_mag =
             sqrtf ((x * x) + (y * y) + (z * z));
         m_have_upright_sample = true;
+        m_motion_guard_until_ms =
+            ri_rtc_millis() + CART_STARTUP_MOTION_GUARD_MS;
     }
 
     /*
