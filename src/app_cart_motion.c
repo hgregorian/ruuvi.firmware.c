@@ -30,6 +30,7 @@
 #define CART_IDLE_TRANSITION_INTERVAL_MS (250U)
 #define CART_IDLE_TRANSITION_DURATION_MS (2200U)
 #define CART_STARTUP_MOTION_GUARD_MS (2000U)
+#define CART_STARTUP_ADV_REPEATS      (3U)
 
 #define CART_DUMP_CONFIRM_SAMPLES   (4U)
 #define CART_DUMP_REQUIRED_HITS     (3U)
@@ -428,6 +429,33 @@ void app_cart_motion_on_motion_isr (void)
     (void) ri_scheduler_event_put (NULL, 0U, &cart_motion);
 }
 
+static void cart_startup_telemetry (void * p_event, uint16_t event_size)
+{
+    (void) p_event;
+    (void) event_size;
+
+    if (m_active || (!m_have_upright_sample) || m_telemetry.valid)
+    {
+        return;
+    }
+
+    /*
+     * Replace any queued startup advertisement with several copies of a fresh
+     * heartbeat whose F0 telemetry is initialized from a second real sample.
+     */
+    (void) rt_adv_stop();
+    app_comms_bleadv_send_count_set (CART_STARTUP_ADV_REPEATS);
+    app_comms_bleadv_interval_set (CART_ACTIVE_ADV_INTERVAL_MS);
+    app_heartbeat_now();
+
+    /*
+     * Queued advertisements retain their captured interval/repeat count.
+     * Restore the normal idle settings for later periodic heartbeats.
+     */
+    app_comms_bleadv_send_count_set (APP_NUM_REPEATS);
+    app_comms_bleadv_interval_set (APP_BLE_INTERVAL_MS);
+}
+
 void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
 {
     if (NULL == p_data)
@@ -444,8 +472,6 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
         return;
     }
 
-    const bool had_upright_sample = m_have_upright_sample;
-
     /*
      * This lets the stationary startup heartbeat following a reboot establish
      * the permanent upright reference before active motion processing begins.
@@ -460,59 +486,65 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
         m_have_upright_sample = true;
         m_motion_guard_until_ms =
             ri_rtc_millis() + CART_STARTUP_MOTION_GUARD_MS;
+
+        /*
+         * Take one additional real sample immediately after startup so passive
+         * telemetry can be initialized without waiting for the slow idle timer.
+         */
+        (void) ri_scheduler_event_put (NULL, 0U, &cart_startup_telemetry);
+        return;
     }
 
     /*
-     * The first startup sample establishes the permanent upright reference.
-     * A later real idle sample may initialize passive telemetry once, but all
-     * DUMP, ROLLING, and motion-state processing remains gated by m_active.
+     * The deferred startup heartbeat is the only idle sample which initializes
+     * passive telemetry. Normal DUMP, ROLLING, and motion-state processing
+     * remains gated by m_active.
      */
     if (!m_active)
     {
-        if ((!had_upright_sample) || m_telemetry.valid)
+        if (!m_telemetry.valid)
         {
-            return;
+            const float sample_mag =
+                sqrtf ((x * x) + (y * y) + (z * z));
+            const float sample_g =
+                sample_mag / m_upright_mag;
+            float confidence = 1.0F;
+
+            if (sample_g > CART_DUMP_CONFIDENCE_ONSET_G)
+            {
+                confidence =
+                    expf (
+                        -(sample_g - CART_DUMP_CONFIDENCE_ONSET_G) /
+                        CART_DUMP_CONFIDENCE_DECAY_G);
+            }
+
+            const float angle_deg =
+                cart_angle_from_reference_deg (
+                    x,
+                    y,
+                    z,
+                    m_upright_x,
+                    m_upright_y,
+                    m_upright_z);
+
+            m_telemetry.valid = true;
+            m_telemetry.active = false;
+            m_telemetry.dump_candidate = m_dump_candidate;
+            m_telemetry.dump_evidence = false;
+            m_telemetry.dump_latched = m_dump_latched;
+            m_telemetry.rolling_candidate = m_rolling_candidate;
+            m_telemetry.rolling_evidence = false;
+            m_telemetry.upright = cart_is_upright (angle_deg);
+            m_telemetry.status = app_cart_motion_status_get();
+            m_telemetry.dump_candidate_hits = m_dump_candidate_hits;
+            m_telemetry.dump_candidate_samples = m_dump_candidate_samples;
+            m_telemetry.rolling_evidence_ms = m_rolling_evidence_ms;
+            m_telemetry.raw_angle_deg = angle_deg;
+            m_telemetry.filtered_angle_deg = angle_deg;
+            m_telemetry.sample_g = sample_g;
+            m_telemetry.confidence = confidence;
         }
 
-        const float sample_mag =
-            sqrtf ((x * x) + (y * y) + (z * z));
-        const float sample_g =
-            sample_mag / m_upright_mag;
-        float confidence = 1.0F;
-
-        if (sample_g > CART_DUMP_CONFIDENCE_ONSET_G)
-        {
-            confidence =
-                expf (
-                    -(sample_g - CART_DUMP_CONFIDENCE_ONSET_G) /
-                    CART_DUMP_CONFIDENCE_DECAY_G);
-        }
-
-        const float angle_deg =
-            cart_angle_from_reference_deg (
-                x,
-                y,
-                z,
-                m_upright_x,
-                m_upright_y,
-                m_upright_z);
-
-        m_telemetry.valid = true;
-        m_telemetry.active = false;
-        m_telemetry.dump_candidate = m_dump_candidate;
-        m_telemetry.dump_evidence = false;
-        m_telemetry.dump_latched = m_dump_latched;
-        m_telemetry.rolling_candidate = m_rolling_candidate;
-        m_telemetry.rolling_evidence = false;
-        m_telemetry.upright = cart_is_upright (angle_deg);
-        m_telemetry.status = app_cart_motion_status_get();
-        m_telemetry.dump_candidate_hits = m_dump_candidate_hits;
-        m_telemetry.dump_candidate_samples = m_dump_candidate_samples;
-        m_telemetry.rolling_evidence_ms = m_rolling_evidence_ms;
-        m_telemetry.raw_angle_deg = angle_deg;
-        m_telemetry.filtered_angle_deg = angle_deg;
-        m_telemetry.sample_g = sample_g;
-        m_telemetry.confidence = confidence;
         return;
     }
 
