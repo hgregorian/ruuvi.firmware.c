@@ -271,7 +271,7 @@ rd_status_t app_dataformat_encode (uint8_t * const output,
 
 
 #define DUMPSENSE_FORMAT_ID          (0xF0U)
-#define DUMPSENSE_SCHEMA_VERSION     (0x01U)
+#define DUMPSENSE_SCHEMA_VERSION     (0x02U)
 #define DUMPSENSE_DATA_LENGTH        (24U)
 #define DUMPSENSE_ANGLE_SCALE        (100.0F)
 #define DUMPSENSE_G_SCALE            (1000.0F)
@@ -489,16 +489,36 @@ rd_status_t app_dataformat_encode_dumpsense (
     }
     output[11] = state_flags;
 
-    output[12] = telemetry.dump_candidate_hits;
-    output[13] = telemetry.dump_candidate_samples;
+    /*
+     * Schema 2 repacks bytes 12..15 without increasing the 24-byte payload:
+     *
+     *   12      DUMP candidate hits (high nibble) / samples (low nibble)
+     *   13      ROLLING evidence in 100 ms ticks
+     *   14..15  Confidence-gated gravity angle, degrees * 100
+     *
+     * DUMP candidate hits/samples are bounded by the four-sample confirmation
+     * window, and ROLLING confirms at 30 ticks, so the compact fields retain
+     * the full useful ranges of the schema 1 diagnostics.
+     */
+    output[12] =
+        (uint8_t) (
+            ((telemetry.dump_candidate_hits & 0x0FU) << 4U) |
+            (telemetry.dump_candidate_samples & 0x0FU));
 
     uint32_t rolling_ticks =
         telemetry.rolling_evidence_ms / DUMPSENSE_ROLLING_TICK_MS;
-    if (rolling_ticks > 65535U)
+    if (rolling_ticks > 255U)
     {
-        rolling_ticks = 65535U;
+        rolling_ticks = 255U;
     }
-    dumpsense_put_u16_be (output, 14U, (uint16_t) rolling_ticks);
+    output[13] = (uint8_t) rolling_ticks;
+
+    dumpsense_put_u16_be (
+        output,
+        14U,
+        dumpsense_u16_from_float (
+            telemetry.gravity_angle_deg,
+            DUMPSENSE_ANGLE_SCALE));
 
     /*
      * Bytes 16..23: advertising queue diagnostics.

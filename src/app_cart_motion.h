@@ -30,6 +30,7 @@ typedef struct
     uint32_t rolling_evidence_ms;
     float raw_angle_deg;
     float filtered_angle_deg;
+    float gravity_angle_deg;
     float sample_g;
     float confidence;
 } app_cart_motion_telemetry_t;

@@ -78,6 +78,22 @@
 #define CART_DUMP_FILTER_TAU_MS     (280.0F)
 
 /*
+ * Parallel diagnostic gravity estimate.
+ *
+ * Unlike the DUMP EMA above, this filter is initialized from the learned
+ * upright reference and is never used by the classifier. Its update weight is
+ * reduced when either acceleration magnitude departs from the stationary
+ * baseline or the acceleration vector changes rapidly between samples.
+ *
+ * The purpose is to estimate quasi-static gravity direction while rejecting
+ * short impacts and translational acceleration strongly enough to distinguish
+ * apparent acceleration-vector angle from likely physical cart orientation.
+ */
+#define CART_GRAVITY_FILTER_TAU_MS              (1000.0F)
+#define CART_GRAVITY_MAG_CONFIDENCE_DECAY_G     (0.10F)
+#define CART_GRAVITY_DELTA_CONFIDENCE_DECAY_G   (0.05F)
+
+/*
  * High-g samples are more likely to be dominated by impact / translational
  * acceleration than gravity. Sample magnitude is normalized against the
  * learned stationary upright magnitude, so 1.0 g reflects this tag's own
@@ -149,6 +165,12 @@ static float m_dump_filtered_x;
 static float m_dump_filtered_y;
 static float m_dump_filtered_z;
 static float m_dump_filter_alpha;
+
+static bool m_have_gravity_filter;
+static float m_gravity_filtered_x;
+static float m_gravity_filtered_y;
+static float m_gravity_filtered_z;
+static float m_gravity_filter_alpha;
 
 static uint64_t m_last_motion_ms;
 static uint64_t m_motion_guard_until_ms;
@@ -231,6 +253,22 @@ static void cart_sample_metrics_get (const float x,
             m_upright_x,
             m_upright_y,
             m_upright_z);
+}
+
+static float cart_gravity_confidence_get (const float sample_g,
+                                          const float delta_g)
+{
+    const float magnitude_confidence =
+        expf (
+            -fabsf (sample_g - 1.0F) /
+            CART_GRAVITY_MAG_CONFIDENCE_DECAY_G);
+
+    const float delta_confidence =
+        expf (
+            -delta_g /
+            CART_GRAVITY_DELTA_CONFIDENCE_DECAY_G);
+
+    return magnitude_confidence * delta_confidence;
 }
 
 static bool cart_is_inverted (const float angle_deg)
@@ -422,6 +460,7 @@ rd_status_t app_cart_motion_init (void)
         m_have_previous_sample = false;
         m_have_upright_sample = false;
         m_have_dump_filter = false;
+        m_have_gravity_filter = false;
 
         cart_dump_candidate_reset();
         m_dump_latched = false;
@@ -441,6 +480,11 @@ rd_status_t app_cart_motion_init (void)
             1.0F - expf (
                 -((float) CART_ANALYSIS_INTERVAL_MS) /
                 CART_DUMP_FILTER_TAU_MS);
+
+        m_gravity_filter_alpha =
+            1.0F - expf (
+                -((float) CART_ANALYSIS_INTERVAL_MS) /
+                CART_GRAVITY_FILTER_TAU_MS);
 
         err_code |= ri_timer_create (&m_idle_timer,
                                      RI_TIMER_MODE_SINGLE_SHOT,
@@ -517,6 +561,12 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
         m_upright_mag =
             sqrtf ((x * x) + (y * y) + (z * z));
         m_have_upright_sample = true;
+
+        m_gravity_filtered_x = x;
+        m_gravity_filtered_y = y;
+        m_gravity_filtered_z = z;
+        m_have_gravity_filter = true;
+
         m_motion_guard_until_ms =
             ri_rtc_millis() + CART_STARTUP_MOTION_GUARD_MS;
 
@@ -563,6 +613,14 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
             m_telemetry.rolling_evidence_ms = m_rolling_evidence_ms;
             m_telemetry.raw_angle_deg = angle_deg;
             m_telemetry.filtered_angle_deg = angle_deg;
+            m_telemetry.gravity_angle_deg =
+                cart_angle_from_reference_deg (
+                    m_gravity_filtered_x,
+                    m_gravity_filtered_y,
+                    m_gravity_filtered_z,
+                    m_upright_x,
+                    m_upright_y,
+                    m_upright_z);
             m_telemetry.sample_g = sample_g;
             m_telemetry.confidence = confidence;
         }
@@ -643,6 +701,7 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
         cart_is_rolling (angle_deg);
 
     bool rolling_evidence = false;
+    float sample_delta_g = NAN;
 
     if (m_dump_latched)
     {
@@ -720,6 +779,9 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
 
         const float delta_g2 = (dx * dx) + (dy * dy) + (dz * dz);
 
+        sample_delta_g =
+            sqrtf (delta_g2) / m_upright_mag;
+
         const bool sample_moving =
             delta_g2 >= CART_SAMPLE_MOTION_G2;
 
@@ -783,6 +845,37 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
         cart_idle_timer_restart();
     }
 
+    /*
+     * Maintain a separate gravity/orientation estimate for diagnostics only.
+     * The first active sample is intentionally ignored because there is no
+     * sample-to-sample delta yet. Dynamic samples receive progressively less
+     * influence as either magnitude error or vector delta increases.
+     */
+    if (m_have_gravity_filter && isfinite (sample_delta_g))
+    {
+        const float gravity_confidence =
+            cart_gravity_confidence_get (sample_g, sample_delta_g);
+
+        const float effective_alpha =
+            m_gravity_filter_alpha * gravity_confidence;
+
+        m_gravity_filtered_x +=
+            effective_alpha * (x - m_gravity_filtered_x);
+        m_gravity_filtered_y +=
+            effective_alpha * (y - m_gravity_filtered_y);
+        m_gravity_filtered_z +=
+            effective_alpha * (z - m_gravity_filtered_z);
+    }
+
+    const float gravity_angle_deg =
+        cart_angle_from_reference_deg (
+            m_gravity_filtered_x,
+            m_gravity_filtered_y,
+            m_gravity_filtered_z,
+            m_upright_x,
+            m_upright_y,
+            m_upright_z);
+
     m_telemetry.valid = true;
     m_telemetry.active = m_active;
     m_telemetry.dump_candidate = m_dump_candidate;
@@ -797,6 +890,7 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
     m_telemetry.rolling_evidence_ms = m_rolling_evidence_ms;
     m_telemetry.raw_angle_deg = angle_deg;
     m_telemetry.filtered_angle_deg = dump_angle_deg;
+    m_telemetry.gravity_angle_deg = gravity_angle_deg;
     m_telemetry.sample_g = sample_g;
     m_telemetry.confidence = confidence;
 
