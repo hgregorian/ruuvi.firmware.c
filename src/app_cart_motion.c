@@ -92,6 +92,13 @@
 #define CART_GRAVITY_FILTER_TAU_MS              (1000.0F)
 #define CART_GRAVITY_MAG_CONFIDENCE_DECAY_G     (0.10F)
 #define CART_GRAVITY_DELTA_CONFIDENCE_DECAY_G   (0.05F)
+#define CART_GRAVITY_ACQUIRE_DURATION_MS         (2000U)
+#define CART_GRAVITY_ACQUIRE_SAMPLES             \
+    (CART_GRAVITY_ACQUIRE_DURATION_MS / CART_ANALYSIS_INTERVAL_MS)
+#define CART_GRAVITY_QUIET_MIN_G                 (0.92F)
+#define CART_GRAVITY_QUIET_MAX_G                 (1.08F)
+#define CART_GRAVITY_QUIET_MAX_DELTA_G           (0.08F)
+#define CART_GRAVITY_QUIET_SAMPLES               (3U)
 
 /*
  * High-g samples are more likely to be dominated by impact / translational
@@ -166,11 +173,32 @@ static float m_dump_filtered_y;
 static float m_dump_filtered_z;
 static float m_dump_filter_alpha;
 
+typedef struct
+{
+    float angle_deg;
+    float x;
+    float y;
+    float z;
+} cart_gravity_acquire_sample_t;
+
 static bool m_have_gravity_filter;
 static float m_gravity_filtered_x;
 static float m_gravity_filtered_y;
 static float m_gravity_filtered_z;
 static float m_gravity_filter_alpha;
+static cart_gravity_acquire_sample_t
+    m_gravity_acquire_samples[CART_GRAVITY_ACQUIRE_SAMPLES];
+static uint8_t m_gravity_acquire_count;
+static bool m_gravity_acquire_ready;
+static bool m_gravity_initial_reanchor_done;
+static bool m_gravity_rolling_seen;
+static float m_gravity_acquire_x;
+static float m_gravity_acquire_y;
+static float m_gravity_acquire_z;
+static float m_gravity_quiet_x[CART_GRAVITY_QUIET_SAMPLES];
+static float m_gravity_quiet_y[CART_GRAVITY_QUIET_SAMPLES];
+static float m_gravity_quiet_z[CART_GRAVITY_QUIET_SAMPLES];
+static uint8_t m_gravity_quiet_count;
 
 static uint64_t m_last_motion_ms;
 static uint64_t m_motion_guard_until_ms;
@@ -271,6 +299,131 @@ static float cart_gravity_confidence_get (const float sample_g,
     return magnitude_confidence * delta_confidence;
 }
 
+static float cart_median3 (const float a,
+                           const float b,
+                           const float c)
+{
+    if (a > b)
+    {
+        if (b > c)
+        {
+            return b;
+        }
+
+        return (a > c) ? c : a;
+    }
+
+    if (a > c)
+    {
+        return a;
+    }
+
+    return (b > c) ? c : b;
+}
+
+static void cart_gravity_event_reset (void)
+{
+    m_gravity_acquire_count = 0U;
+    m_gravity_acquire_ready = false;
+    m_gravity_initial_reanchor_done = false;
+    m_gravity_rolling_seen = false;
+    m_gravity_quiet_count = 0U;
+}
+
+static void cart_gravity_acquire_finalize (void)
+{
+    /*
+     * Sort the initial ACTIVE window by the existing filtered angle while
+     * retaining the actual filtered XYZ vector associated with each sample.
+     * Offline replay showed that the lower quartile reduced the upward bias
+     * from ordinary rolling acceleration while preserving known 20-25 degree
+     * rolling orientation.
+     */
+    for (uint8_t i = 1U; i < m_gravity_acquire_count; i++)
+    {
+        const cart_gravity_acquire_sample_t sample =
+            m_gravity_acquire_samples[i];
+        uint8_t j = i;
+
+        while ( (j > 0U) &&
+                (m_gravity_acquire_samples[j - 1U].angle_deg >
+                 sample.angle_deg))
+        {
+            m_gravity_acquire_samples[j] =
+                m_gravity_acquire_samples[j - 1U];
+            j--;
+        }
+
+        m_gravity_acquire_samples[j] = sample;
+    }
+
+    /*
+     * round(0.25 * (N - 1)) selects a real buffered sample near the lower
+     * quartile without synthesizing a direction from an angle alone.
+     */
+    const uint8_t quartile_index =
+        (uint8_t) ((((uint32_t) m_gravity_acquire_count - 1U) + 2U) / 4U);
+
+    m_gravity_acquire_x =
+        m_gravity_acquire_samples[quartile_index].x;
+    m_gravity_acquire_y =
+        m_gravity_acquire_samples[quartile_index].y;
+    m_gravity_acquire_z =
+        m_gravity_acquire_samples[quartile_index].z;
+    m_gravity_acquire_ready = true;
+}
+
+static void cart_gravity_acquire_add (const float x,
+                                      const float y,
+                                      const float z,
+                                      const float angle_deg)
+{
+    if (m_gravity_acquire_ready ||
+        (m_gravity_acquire_count >= CART_GRAVITY_ACQUIRE_SAMPLES))
+    {
+        return;
+    }
+
+    m_gravity_acquire_samples[m_gravity_acquire_count].angle_deg = angle_deg;
+    m_gravity_acquire_samples[m_gravity_acquire_count].x = x;
+    m_gravity_acquire_samples[m_gravity_acquire_count].y = y;
+    m_gravity_acquire_samples[m_gravity_acquire_count].z = z;
+    m_gravity_acquire_count++;
+
+    if (m_gravity_acquire_count >= CART_GRAVITY_ACQUIRE_SAMPLES)
+    {
+        cart_gravity_acquire_finalize();
+    }
+}
+
+static void cart_gravity_quiet_add (const float x,
+                                    const float y,
+                                    const float z)
+{
+    m_gravity_quiet_x[m_gravity_quiet_count] = x;
+    m_gravity_quiet_y[m_gravity_quiet_count] = y;
+    m_gravity_quiet_z[m_gravity_quiet_count] = z;
+    m_gravity_quiet_count++;
+
+    if (m_gravity_quiet_count >= CART_GRAVITY_QUIET_SAMPLES)
+    {
+        m_gravity_filtered_x =
+            cart_median3 (m_gravity_quiet_x[0],
+                          m_gravity_quiet_x[1],
+                          m_gravity_quiet_x[2]);
+        m_gravity_filtered_y =
+            cart_median3 (m_gravity_quiet_y[0],
+                          m_gravity_quiet_y[1],
+                          m_gravity_quiet_y[2]);
+        m_gravity_filtered_z =
+            cart_median3 (m_gravity_quiet_z[0],
+                          m_gravity_quiet_z[1],
+                          m_gravity_quiet_z[2]);
+        m_have_gravity_filter = true;
+        m_gravity_quiet_count = 0U;
+    }
+}
+
 static bool cart_is_inverted (const float angle_deg)
 {
     return angle_deg >= CART_DUMP_ANGLE_DEG;
@@ -367,6 +520,7 @@ static void cart_idle (void * p_event, uint16_t event_size)
     m_active = false;
     m_have_previous_sample = false;
     m_have_dump_filter = false;
+    cart_gravity_event_reset();
     m_rolling_candidate = false;
     m_rolling = false;
     m_rolling_evidence_ms = 0U;
@@ -436,6 +590,7 @@ static void cart_motion (void * p_event, uint16_t event_size)
         m_active = true;
         m_have_previous_sample = false;
         m_have_dump_filter = false;
+        cart_gravity_event_reset();
 
         /*
          * Generate fresh telemetry immediately rather than waiting for the
@@ -461,6 +616,7 @@ rd_status_t app_cart_motion_init (void)
         m_have_upright_sample = false;
         m_have_dump_filter = false;
         m_have_gravity_filter = false;
+        cart_gravity_event_reset();
 
         cart_dump_candidate_reset();
         m_dump_latched = false;
@@ -684,6 +840,12 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
             m_upright_y,
             m_upright_z);
 
+    cart_gravity_acquire_add (
+        m_dump_filtered_x,
+        m_dump_filtered_y,
+        m_dump_filtered_z,
+        dump_angle_deg);
+
     const bool inverted =
         cart_is_inverted (dump_angle_deg);
 
@@ -821,6 +983,7 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
                 {
                     m_rolling_candidate = false;
                     m_rolling = true;
+                    m_gravity_rolling_seen = true;
                 }
             }
             m_last_rolling_motion_ms = now_ms;
@@ -846,12 +1009,61 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
     }
 
     /*
-     * Maintain a separate gravity/orientation estimate for diagnostics only.
-     * The first active sample is intentionally ignored because there is no
-     * sample-to-sample delta yet. Dynamic samples receive progressively less
-     * influence as either magnitude error or vector delta increases.
+     * Gravity remains diagnostic-only. The first two seconds of each ACTIVE
+     * event provide a provisional rolling orientation. Once ROLLING has been
+     * observed, adopt that lower-quartile filtered vector as the initial
+     * orientation even if ROLLING was confirmed before the two-second window
+     * finished.
+     *
+     * After that initial acquisition, dynamic samples do not drag Gravity
+     * around. Instead, permit re-acquisition only after three consecutive
+     * quasi-static samples: magnitude within 0.92-1.08 of the learned upright
+     * baseline and sample-to-sample vector change no greater than 0.08 g. The
+     * coordinate-wise median of those three existing filtered XYZ vectors is
+     * then used as the new Gravity orientation. This lets Gravity adapt during
+     * brief trustworthy intervals within a rolling episode without following
+     * sustained translational acceleration.
+     *
+     * Before ROLLING has ever been confirmed in the current ACTIVE episode,
+     * retain the original conservative confidence-weighted EMA so stationary
+     * non-rolling orientation changes remain observable.
      */
-    if (m_have_gravity_filter && isfinite (sample_delta_g))
+    if (m_gravity_rolling_seen &&
+        m_gravity_acquire_ready &&
+        (!m_gravity_initial_reanchor_done))
+    {
+        m_gravity_filtered_x = m_gravity_acquire_x;
+        m_gravity_filtered_y = m_gravity_acquire_y;
+        m_gravity_filtered_z = m_gravity_acquire_z;
+        m_have_gravity_filter = true;
+        m_gravity_initial_reanchor_done = true;
+        m_gravity_quiet_count = 0U;
+    }
+
+    if (m_gravity_rolling_seen &&
+        m_gravity_initial_reanchor_done &&
+        isfinite (sample_delta_g))
+    {
+        const bool gravity_quiet_sample =
+            (sample_g >= CART_GRAVITY_QUIET_MIN_G) &&
+            (sample_g <= CART_GRAVITY_QUIET_MAX_G) &&
+            (sample_delta_g <= CART_GRAVITY_QUIET_MAX_DELTA_G);
+
+        if (gravity_quiet_sample)
+        {
+            cart_gravity_quiet_add (
+                m_dump_filtered_x,
+                m_dump_filtered_y,
+                m_dump_filtered_z);
+        }
+        else
+        {
+            m_gravity_quiet_count = 0U;
+        }
+    }
+    else if ((!m_gravity_rolling_seen) &&
+             m_have_gravity_filter &&
+             isfinite (sample_delta_g))
     {
         const float gravity_confidence =
             cart_gravity_confidence_get (sample_g, sample_delta_g);
