@@ -337,9 +337,10 @@ static void cart_gravity_acquire_finalize (void)
     /*
      * Sort the initial ACTIVE window by the existing filtered angle while
      * retaining the actual filtered XYZ vector associated with each sample.
-     * Offline replay showed that the lower quartile reduced the upward bias
-     * from ordinary rolling acceleration while preserving known 20-25 degree
-     * rolling orientation.
+     * Offline replay showed that the median tracks known rolling orientation
+     * better when the cart is tilted and immediately rolled, while the
+     * re-anchor gate below prevents an upright event from adopting a false
+     * dynamic tilt.
      */
     for (uint8_t i = 1U; i < m_gravity_acquire_count; i++)
     {
@@ -360,18 +361,19 @@ static void cart_gravity_acquire_finalize (void)
     }
 
     /*
-     * round(0.25 * (N - 1)) selects a real buffered sample near the lower
-     * quartile without synthesizing a direction from an angle alone.
+     * Select a real buffered sample at the median rank so the XYZ direction
+     * remains one actually observed filtered vector rather than a synthesized
+     * direction. For an even sample count, use the upper middle sample.
      */
-    const uint8_t quartile_index =
-        (uint8_t) ((((uint32_t) m_gravity_acquire_count - 1U) + 2U) / 4U);
+    const uint8_t median_index =
+        (uint8_t) (m_gravity_acquire_count / 2U);
 
     m_gravity_acquire_x =
-        m_gravity_acquire_samples[quartile_index].x;
+        m_gravity_acquire_samples[median_index].x;
     m_gravity_acquire_y =
-        m_gravity_acquire_samples[quartile_index].y;
+        m_gravity_acquire_samples[median_index].y;
     m_gravity_acquire_z =
-        m_gravity_acquire_samples[quartile_index].z;
+        m_gravity_acquire_samples[median_index].z;
     m_gravity_acquire_ready = true;
 }
 
@@ -1031,9 +1033,11 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
     /*
      * Gravity remains diagnostic-only. The first two seconds of each ACTIVE
      * event provide a provisional rolling orientation. Once ROLLING has been
-     * observed, adopt that lower-quartile filtered vector as the initial
-     * orientation even if ROLLING was confirmed before the two-second window
-     * finished.
+     * observed, consider the median filtered vector as the initial orientation
+     * even if ROLLING was confirmed before the two-second window finished.
+     * Apply that one-time re-anchor only when Gravity is still upright and the
+     * median candidate is meaningfully tilted. This preserves an already-known
+     * tilted orientation and prevents upright motion from manufacturing tilt.
      *
      * After that initial acquisition, dynamic samples do not drag Gravity
      * around. Instead, permit re-acquisition only after three consecutive
@@ -1052,10 +1056,35 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
         m_gravity_acquire_ready &&
         (!m_gravity_initial_reanchor_done))
     {
-        m_gravity_filtered_x = m_gravity_acquire_x;
-        m_gravity_filtered_y = m_gravity_acquire_y;
-        m_gravity_filtered_z = m_gravity_acquire_z;
-        m_have_gravity_filter = true;
+        const float current_gravity_angle_deg =
+            cart_angle_from_reference_deg (
+                m_gravity_filtered_x,
+                m_gravity_filtered_y,
+                m_gravity_filtered_z,
+                m_upright_x,
+                m_upright_y,
+                m_upright_z);
+
+        const float acquire_gravity_angle_deg =
+            cart_angle_from_reference_deg (
+                m_gravity_acquire_x,
+                m_gravity_acquire_y,
+                m_gravity_acquire_z,
+                m_upright_x,
+                m_upright_y,
+                m_upright_z);
+
+        if (isfinite (current_gravity_angle_deg) &&
+            isfinite (acquire_gravity_angle_deg) &&
+            cart_is_upright (current_gravity_angle_deg) &&
+            (!cart_is_upright (acquire_gravity_angle_deg)))
+        {
+            m_gravity_filtered_x = m_gravity_acquire_x;
+            m_gravity_filtered_y = m_gravity_acquire_y;
+            m_gravity_filtered_z = m_gravity_acquire_z;
+            m_have_gravity_filter = true;
+        }
+
         m_gravity_initial_reanchor_done = true;
         m_gravity_quiet_count = 0U;
     }
