@@ -1,4 +1,5 @@
 #include "app_cart_motion.h"
+#include "app_comms.h"
 #include "app_dataformats.h"
 #include "app_sensor.h"
 #include "ruuvi_endpoints.h"
@@ -281,6 +282,7 @@ rd_status_t app_dataformat_encode (uint8_t * const output,
 #define DUMPSENSE_FLAG_DUMP_EVIDENCE     (1U << 2U)
 #define DUMPSENSE_FLAG_ROLLING_CANDIDATE (1U << 3U)
 #define DUMPSENSE_FLAG_ROLLING_EVIDENCE  (1U << 4U)
+#define DUMPSENSE_FLAG_MGMT_ACTIVE       (1U << 5U)
 
 static uint8_t m_raw_adv_nomem_count;
 static uint8_t m_f0_adv_nomem_count;
@@ -471,6 +473,10 @@ rd_status_t app_dataformat_encode_dumpsense (
     if (telemetry.rolling_evidence)
     {
         state_flags |= DUMPSENSE_FLAG_ROLLING_EVIDENCE;
+    }
+    if (app_comms_management_active_get())
+    {
+        state_flags |= DUMPSENSE_FLAG_MGMT_ACTIVE;
     }
     output[11] = state_flags;
 

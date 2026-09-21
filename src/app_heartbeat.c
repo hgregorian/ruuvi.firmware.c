@@ -33,17 +33,6 @@
 #define APP_DF_8_ENABLED 0
 #define APP_DF_FA_ENABLED 0
 
-rd_status_t app_dataformat_encode_dumpsense (
-    uint8_t * const output,
-    size_t * const output_length);
-uint16_t app_dataformat_rawv2_sequence_get (void);
-void app_dataformat_adv_diag_record_raw (
-    const rd_status_t err_code,
-    const uint16_t sequence);
-void app_dataformat_adv_diag_record_f0 (
-    const rd_status_t err_code,
-    const uint16_t sequence);
-
 static ri_timer_id_t heart_timer; //!< Timer for updating data.
 
 static uint32_t heart_interval_ms = APP_HEARTBEAT_INTERVAL_MS;
