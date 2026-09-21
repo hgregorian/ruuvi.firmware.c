@@ -271,19 +271,16 @@ rd_status_t app_dataformat_encode (uint8_t * const output,
 
 
 #define DUMPSENSE_FORMAT_ID          (0xF0U)
-#define DUMPSENSE_SCHEMA_VERSION     (0x01U)
+#define DUMPSENSE_SCHEMA_VERSION     (0x04U)
 #define DUMPSENSE_DATA_LENGTH        (24U)
 #define DUMPSENSE_ANGLE_SCALE        (100.0F)
 #define DUMPSENSE_G_SCALE            (1000.0F)
 #define DUMPSENSE_CONFIDENCE_SCALE   (255.0F)
 #define DUMPSENSE_ROLLING_TICK_MS    (100U)
 
-#define DUMPSENSE_FLAG_DUMP_CANDIDATE    (1U << 2U)
-#define DUMPSENSE_FLAG_DUMP_EVIDENCE     (1U << 3U)
-#define DUMPSENSE_FLAG_DUMP_LATCHED      (1U << 4U)
-#define DUMPSENSE_FLAG_ROLLING_CANDIDATE (1U << 5U)
-#define DUMPSENSE_FLAG_ROLLING_EVIDENCE  (1U << 6U)
-#define DUMPSENSE_FLAG_UPRIGHT           (1U << 7U)
+#define DUMPSENSE_FLAG_DUMP_EVIDENCE     (1U << 2U)
+#define DUMPSENSE_FLAG_ROLLING_CANDIDATE (1U << 3U)
+#define DUMPSENSE_FLAG_ROLLING_EVIDENCE  (1U << 4U)
 
 static uint8_t m_raw_adv_nomem_count;
 static uint8_t m_f0_adv_nomem_count;
@@ -463,17 +460,9 @@ rd_status_t app_dataformat_encode_dumpsense (
 
     uint8_t state_flags = operational_state & 0x03U;
 
-    if (telemetry.dump_candidate)
-    {
-        state_flags |= DUMPSENSE_FLAG_DUMP_CANDIDATE;
-    }
     if (telemetry.dump_evidence)
     {
         state_flags |= DUMPSENSE_FLAG_DUMP_EVIDENCE;
-    }
-    if (telemetry.dump_latched)
-    {
-        state_flags |= DUMPSENSE_FLAG_DUMP_LATCHED;
     }
     if (telemetry.rolling_candidate)
     {
@@ -483,22 +472,41 @@ rd_status_t app_dataformat_encode_dumpsense (
     {
         state_flags |= DUMPSENSE_FLAG_ROLLING_EVIDENCE;
     }
-    if (telemetry.upright)
-    {
-        state_flags |= DUMPSENSE_FLAG_UPRIGHT;
-    }
     output[11] = state_flags;
 
-    output[12] = telemetry.dump_candidate_hits;
-    output[13] = telemetry.dump_candidate_samples;
+    /*
+     * Schema 4 keeps the schema 3 fields through byte 13 unchanged and
+     * reserves the former diagnostic field:
+     *
+     *   12      While DUMP is latched: assertion age in 100 ms ticks.
+     *           Otherwise: DUMP candidate hits (high nibble) / samples
+     *           (low nibble).
+     *   13      ROLLING evidence in 100 ms ticks.
+     *   14..15  Reserved.
+     *
+     * DUMP candidate hits/samples are bounded by the four-sample confirmation
+     * window. DUMP assertion age saturates at 25.5 seconds, comfortably beyond
+     * the current 15-second active hold.
+     */
+    if (telemetry.dump_latched)
+    {
+        output[12] = telemetry.dump_age_ticks;
+    }
+    else
+    {
+        output[12] =
+            (uint8_t) (
+                ((telemetry.dump_candidate_hits & 0x0FU) << 4U) |
+                (telemetry.dump_candidate_samples & 0x0FU));
+    }
 
     uint32_t rolling_ticks =
         telemetry.rolling_evidence_ms / DUMPSENSE_ROLLING_TICK_MS;
-    if (rolling_ticks > 65535U)
+    if (rolling_ticks > 255U)
     {
-        rolling_ticks = 65535U;
+        rolling_ticks = 255U;
     }
-    dumpsense_put_u16_be (output, 14U, (uint16_t) rolling_ticks);
+    output[13] = (uint8_t) rolling_ticks;
 
     /*
      * Bytes 16..23: advertising queue diagnostics.

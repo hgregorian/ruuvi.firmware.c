@@ -27,6 +27,7 @@ typedef struct
     uint8_t status;
     uint8_t dump_candidate_hits;
     uint8_t dump_candidate_samples;
+    uint8_t dump_age_ticks;
     uint32_t rolling_evidence_ms;
     float raw_angle_deg;
     float filtered_angle_deg;

@@ -35,6 +35,7 @@
 #define CART_DUMP_CONFIRM_SAMPLES   (4U)
 #define CART_DUMP_REQUIRED_HITS     (3U)
 #define CART_DUMP_ACTIVE_HOLD_MS    (15U * 1000U)
+#define CART_DUMP_AGE_TICK_MS       (100U)
 
 /*
  * Consider the cart inverted when its acceleration vector is at least
@@ -154,6 +155,7 @@ static uint64_t m_last_motion_ms;
 static uint64_t m_motion_guard_until_ms;
 static uint8_t m_dump_candidate_samples;
 static uint8_t m_dump_candidate_hits;
+static uint64_t m_dump_asserted_ms;
 static uint64_t m_dump_min_hold_until_ms;
 static bool m_rolling_candidate;
 static bool m_rolling;
@@ -268,6 +270,19 @@ static void cart_dump_candidate_start (void)
     m_dump_candidate_hits = 1U;
 }
 
+static uint8_t cart_dump_age_ticks_get (const uint64_t now_ms)
+{
+    if (!m_dump_latched)
+    {
+        return 0U;
+    }
+
+    const uint64_t age_ticks =
+        (now_ms - m_dump_asserted_ms) / CART_DUMP_AGE_TICK_MS;
+
+    return (uint8_t) ((age_ticks > 0xFFU) ? 0xFFU : age_ticks);
+}
+
 static void cart_idle_timer_restart (void)
 {
     m_idle_restore_pending = false;
@@ -318,6 +333,7 @@ static void cart_idle (void * p_event, uint16_t event_size)
     if (m_dump_latched)
     {
         m_dump_latched = false;
+        m_dump_asserted_ms = 0U;
         cart_dump_candidate_reset();
         m_dump_armed = true;
     }
@@ -429,6 +445,7 @@ rd_status_t app_cart_motion_init (void)
 
         m_last_motion_ms = 0U;
         m_motion_guard_until_ms = 0U;
+        m_dump_asserted_ms = 0U;
         m_dump_min_hold_until_ms = 0U;
         m_rolling_candidate = false;
         m_rolling = false;
@@ -560,6 +577,7 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
             m_telemetry.status = app_cart_motion_status_get();
             m_telemetry.dump_candidate_hits = m_dump_candidate_hits;
             m_telemetry.dump_candidate_samples = m_dump_candidate_samples;
+            m_telemetry.dump_age_ticks = 0U;
             m_telemetry.rolling_evidence_ms = m_rolling_evidence_ms;
             m_telemetry.raw_angle_deg = angle_deg;
             m_telemetry.filtered_angle_deg = angle_deg;
@@ -657,6 +675,7 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
         if ( (now_ms >= m_dump_min_hold_until_ms) && dump_rearmed)
         {
             m_dump_latched = false;
+            m_dump_asserted_ms = 0U;
             m_dump_armed = true;
         }
     }
@@ -684,6 +703,7 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
                 {
                     cart_dump_candidate_reset();
                     m_dump_latched = true;
+                    m_dump_asserted_ms = now_ms;
                     m_dump_armed = false;
                     m_dump_min_hold_until_ms =
                         now_ms + CART_DUMP_ACTIVE_HOLD_MS;
@@ -794,6 +814,7 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
     m_telemetry.status = app_cart_motion_status_get();
     m_telemetry.dump_candidate_hits = m_dump_candidate_hits;
     m_telemetry.dump_candidate_samples = m_dump_candidate_samples;
+    m_telemetry.dump_age_ticks = cart_dump_age_ticks_get (now_ms);
     m_telemetry.rolling_evidence_ms = m_rolling_evidence_ms;
     m_telemetry.raw_angle_deg = angle_deg;
     m_telemetry.filtered_angle_deg = dump_angle_deg;
@@ -841,6 +862,8 @@ bool app_cart_motion_telemetry_get (
     p_telemetry->status = app_cart_motion_status_get();
     p_telemetry->dump_candidate_hits = m_dump_candidate_hits;
     p_telemetry->dump_candidate_samples = m_dump_candidate_samples;
+    p_telemetry->dump_age_ticks =
+        cart_dump_age_ticks_get (ri_rtc_millis());
     p_telemetry->rolling_evidence_ms = m_rolling_evidence_ms;
     return m_telemetry.valid;
 }
