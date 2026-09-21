@@ -93,9 +93,6 @@
 #define CART_GRAVITY_FILTER_TAU_MS              (1000.0F)
 #define CART_GRAVITY_MAG_CONFIDENCE_DECAY_G     (0.10F)
 #define CART_GRAVITY_DELTA_CONFIDENCE_DECAY_G   (0.05F)
-#define CART_GRAVITY_ACQUIRE_DURATION_MS         (2000U)
-#define CART_GRAVITY_ACQUIRE_SAMPLES             \
-    (CART_GRAVITY_ACQUIRE_DURATION_MS / CART_ANALYSIS_INTERVAL_MS)
 #define CART_GRAVITY_QUIET_MIN_G                 (0.92F)
 #define CART_GRAVITY_QUIET_MAX_G                 (1.08F)
 #define CART_GRAVITY_QUIET_MAX_DELTA_G           (0.08F)
@@ -174,28 +171,12 @@ static float m_dump_filtered_y;
 static float m_dump_filtered_z;
 static float m_dump_filter_alpha;
 
-typedef struct
-{
-    float angle_deg;
-    float x;
-    float y;
-    float z;
-} cart_gravity_acquire_sample_t;
-
 static bool m_have_gravity_filter;
 static float m_gravity_filtered_x;
 static float m_gravity_filtered_y;
 static float m_gravity_filtered_z;
 static float m_gravity_filter_alpha;
-static cart_gravity_acquire_sample_t
-    m_gravity_acquire_samples[CART_GRAVITY_ACQUIRE_SAMPLES];
-static uint8_t m_gravity_acquire_count;
-static bool m_gravity_acquire_ready;
-static bool m_gravity_initial_reanchor_done;
 static bool m_gravity_rolling_seen;
-static float m_gravity_acquire_x;
-static float m_gravity_acquire_y;
-static float m_gravity_acquire_z;
 static float m_gravity_quiet_x[CART_GRAVITY_QUIET_SAMPLES];
 static float m_gravity_quiet_y[CART_GRAVITY_QUIET_SAMPLES];
 static float m_gravity_quiet_z[CART_GRAVITY_QUIET_SAMPLES];
@@ -325,123 +306,8 @@ static float cart_median3 (const float a,
 
 static void cart_gravity_event_reset (void)
 {
-    m_gravity_acquire_count = 0U;
-    m_gravity_acquire_ready = false;
-    m_gravity_initial_reanchor_done = false;
     m_gravity_rolling_seen = false;
     m_gravity_quiet_count = 0U;
-}
-
-static void cart_gravity_acquire_finalize (void)
-{
-    /*
-     * Preserve a median candidate from the chronological second half of the
-     * acquisition window before sorting the complete window. This can reduce
-     * upright-to-tilted transition bias when ROLLING has not yet been confirmed
-     * by the time acquisition finishes.
-     */
-    const uint8_t later_start =
-        (uint8_t) (m_gravity_acquire_count / 2U);
-
-    for (uint8_t i = (uint8_t) (later_start + 1U);
-         i < m_gravity_acquire_count;
-         i++)
-    {
-        const cart_gravity_acquire_sample_t sample =
-            m_gravity_acquire_samples[i];
-        uint8_t j = i;
-
-        while ( (j > later_start) &&
-                (m_gravity_acquire_samples[j - 1U].angle_deg >
-                 sample.angle_deg))
-        {
-            m_gravity_acquire_samples[j] =
-                m_gravity_acquire_samples[j - 1U];
-            j--;
-        }
-
-        m_gravity_acquire_samples[j] = sample;
-    }
-
-    const uint8_t later_count =
-        (uint8_t) (m_gravity_acquire_count - later_start);
-    const uint8_t later_median_index =
-        (uint8_t) (later_start + (later_count / 2U));
-    const cart_gravity_acquire_sample_t later_median_sample =
-        m_gravity_acquire_samples[later_median_index];
-
-    /*
-     * Sort the complete initial ACTIVE window by the existing filtered angle
-     * while retaining the actual filtered XYZ vector associated with each
-     * sample.
-     */
-    for (uint8_t i = 1U; i < m_gravity_acquire_count; i++)
-    {
-        const cart_gravity_acquire_sample_t sample =
-            m_gravity_acquire_samples[i];
-        uint8_t j = i;
-
-        while ( (j > 0U) &&
-                (m_gravity_acquire_samples[j - 1U].angle_deg >
-                 sample.angle_deg))
-        {
-            m_gravity_acquire_samples[j] =
-                m_gravity_acquire_samples[j - 1U];
-            j--;
-        }
-
-        m_gravity_acquire_samples[j] = sample;
-    }
-
-    /*
-     * The complete-window median remains the eligibility gate. If it is still
-     * upright, retain it so the re-anchor gate below rejects the event. If it is
-     * tilted and ROLLING had not already been confirmed before acquisition
-     * finished, allow the second-half median to raise the provisional
-     * orientation when it is more tilted. This removes transition bias without
-     * letting a late dynamic tail manufacture tilt in an otherwise-upright
-     * event. For even sample counts, both medians use the upper middle sample.
-     */
-    const uint8_t median_index =
-        (uint8_t) (m_gravity_acquire_count / 2U);
-    const cart_gravity_acquire_sample_t median_sample =
-        m_gravity_acquire_samples[median_index];
-    cart_gravity_acquire_sample_t selected_sample = median_sample;
-
-    if ((!m_gravity_rolling_seen) &&
-        (median_sample.angle_deg > CART_UPRIGHT_ANGLE_DEG) &&
-        (later_median_sample.angle_deg > median_sample.angle_deg))
-    {
-        selected_sample = later_median_sample;
-    }
-
-    m_gravity_acquire_x = selected_sample.x;
-    m_gravity_acquire_y = selected_sample.y;
-    m_gravity_acquire_z = selected_sample.z;
-    m_gravity_acquire_ready = true;
-}
-
-static void cart_gravity_acquire_add (const float x,
-                                      const float y,
-                                      const float z,
-                                      const float angle_deg)
-{
-    if (m_gravity_acquire_ready ||
-        (m_gravity_acquire_count >= CART_GRAVITY_ACQUIRE_SAMPLES))
-    {
-        return;
-    }
-
-    m_gravity_acquire_samples[m_gravity_acquire_count].angle_deg = angle_deg;
-    m_gravity_acquire_samples[m_gravity_acquire_count].x = x;
-    m_gravity_acquire_samples[m_gravity_acquire_count].y = y;
-    m_gravity_acquire_samples[m_gravity_acquire_count].z = z;
-    m_gravity_acquire_count++;
-
-    if (m_gravity_acquire_count >= CART_GRAVITY_ACQUIRE_SAMPLES)
-    {
-        cart_gravity_acquire_finalize();
-    }
 }
 
 static void cart_gravity_quiet_add (const float x,
@@ -904,12 +770,6 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
             m_upright_y,
             m_upright_z);
 
-    cart_gravity_acquire_add (
-        m_dump_filtered_x,
-        m_dump_filtered_y,
-        m_dump_filtered_z,
-        dump_angle_deg);
-
     const bool inverted =
         cart_is_inverted (dump_angle_deg);
 
@@ -1077,8 +937,7 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
     /*
      * Gravity remains diagnostic-only. Dynamic rolling does not provide a
      * trustworthy way to separate gravity from translational acceleration using
-     * the accelerometer alone, so ROLLING no longer forces a one-time re-anchor
-     * from the initial acquisition window.
+     * the accelerometer alone.
      *
      * Once ROLLING has been observed, keep the last trusted Gravity orientation
      * until three consecutive quasi-static samples are available: magnitude
@@ -1093,14 +952,6 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
      * non-rolling orientation changes remain observable.
      */
     if (m_gravity_rolling_seen &&
-        (!m_gravity_initial_reanchor_done))
-    {
-        m_gravity_initial_reanchor_done = true;
-        m_gravity_quiet_count = 0U;
-    }
-
-    if (m_gravity_rolling_seen &&
-        m_gravity_initial_reanchor_done &&
         isfinite (sample_delta_g))
     {
         const bool gravity_quiet_sample =
