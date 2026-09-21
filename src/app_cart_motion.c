@@ -335,12 +335,45 @@ static void cart_gravity_event_reset (void)
 static void cart_gravity_acquire_finalize (void)
 {
     /*
-     * Sort the initial ACTIVE window by the existing filtered angle while
-     * retaining the actual filtered XYZ vector associated with each sample.
-     * Offline replay showed that the median tracks known rolling orientation
-     * better when the cart is tilted and immediately rolled, while the
-     * re-anchor gate below prevents an upright event from adopting a false
-     * dynamic tilt.
+     * Preserve a median candidate from the chronological second half of the
+     * acquisition window before sorting the complete window. This can reduce
+     * upright-to-tilted transition bias when ROLLING has not yet been confirmed
+     * by the time acquisition finishes.
+     */
+    const uint8_t later_start =
+        (uint8_t) (m_gravity_acquire_count / 2U);
+
+    for (uint8_t i = (uint8_t) (later_start + 1U);
+         i < m_gravity_acquire_count;
+         i++)
+    {
+        const cart_gravity_acquire_sample_t sample =
+            m_gravity_acquire_samples[i];
+        uint8_t j = i;
+
+        while ( (j > later_start) &&
+                (m_gravity_acquire_samples[j - 1U].angle_deg >
+                 sample.angle_deg))
+        {
+            m_gravity_acquire_samples[j] =
+                m_gravity_acquire_samples[j - 1U];
+            j--;
+        }
+
+        m_gravity_acquire_samples[j] = sample;
+    }
+
+    const uint8_t later_count =
+        (uint8_t) (m_gravity_acquire_count - later_start);
+    const uint8_t later_median_index =
+        (uint8_t) (later_start + (later_count / 2U));
+    const cart_gravity_acquire_sample_t later_median_sample =
+        m_gravity_acquire_samples[later_median_index];
+
+    /*
+     * Sort the complete initial ACTIVE window by the existing filtered angle
+     * while retaining the actual filtered XYZ vector associated with each
+     * sample.
      */
     for (uint8_t i = 1U; i < m_gravity_acquire_count; i++)
     {
@@ -361,19 +394,30 @@ static void cart_gravity_acquire_finalize (void)
     }
 
     /*
-     * Select a real buffered sample at the median rank so the XYZ direction
-     * remains one actually observed filtered vector rather than a synthesized
-     * direction. For an even sample count, use the upper middle sample.
+     * The complete-window median remains the eligibility gate. If it is still
+     * upright, retain it so the re-anchor gate below rejects the event. If it is
+     * tilted and ROLLING had not already been confirmed before acquisition
+     * finished, allow the second-half median to raise the provisional
+     * orientation when it is more tilted. This removes transition bias without
+     * letting a late dynamic tail manufacture tilt in an otherwise-upright
+     * event. For even sample counts, both medians use the upper middle sample.
      */
     const uint8_t median_index =
         (uint8_t) (m_gravity_acquire_count / 2U);
+    const cart_gravity_acquire_sample_t median_sample =
+        m_gravity_acquire_samples[median_index];
+    cart_gravity_acquire_sample_t selected_sample = median_sample;
 
-    m_gravity_acquire_x =
-        m_gravity_acquire_samples[median_index].x;
-    m_gravity_acquire_y =
-        m_gravity_acquire_samples[median_index].y;
-    m_gravity_acquire_z =
-        m_gravity_acquire_samples[median_index].z;
+    if ((!m_gravity_rolling_seen) &&
+        (median_sample.angle_deg > CART_UPRIGHT_ANGLE_DEG) &&
+        (later_median_sample.angle_deg > median_sample.angle_deg))
+    {
+        selected_sample = later_median_sample;
+    }
+
+    m_gravity_acquire_x = selected_sample.x;
+    m_gravity_acquire_y = selected_sample.y;
+    m_gravity_acquire_z = selected_sample.z;
     m_gravity_acquire_ready = true;
 }
 
@@ -1033,10 +1077,11 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
     /*
      * Gravity remains diagnostic-only. The first two seconds of each ACTIVE
      * event provide a provisional rolling orientation. Once ROLLING has been
-     * observed, consider the median filtered vector as the initial orientation
-     * even if ROLLING was confirmed before the two-second window finished.
+     * observed, consider the selected acquisition vector as the initial
+     * orientation even if ROLLING was confirmed before the two-second window
+     * finished.
      * Apply that one-time re-anchor only when Gravity is still upright and the
-     * median candidate is meaningfully tilted. This preserves an already-known
+     * selected candidate is meaningfully tilted. This preserves an already-known
      * tilted orientation and prevents upright motion from manufacturing tilt.
      *
      * After that initial acquisition, dynamic samples do not drag Gravity
