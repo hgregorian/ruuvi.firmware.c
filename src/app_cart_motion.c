@@ -1075,61 +1075,26 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
     }
 
     /*
-     * Gravity remains diagnostic-only. The first two seconds of each ACTIVE
-     * event provide a provisional rolling orientation. Once ROLLING has been
-     * observed, consider the selected acquisition vector as the initial
-     * orientation even if ROLLING was confirmed before the two-second window
-     * finished.
-     * Apply that one-time re-anchor only when Gravity is still upright and the
-     * selected candidate is meaningfully tilted. This preserves an already-known
-     * tilted orientation and prevents upright motion from manufacturing tilt.
+     * Gravity remains diagnostic-only. Dynamic rolling does not provide a
+     * trustworthy way to separate gravity from translational acceleration using
+     * the accelerometer alone, so ROLLING no longer forces a one-time re-anchor
+     * from the initial acquisition window.
      *
-     * After that initial acquisition, dynamic samples do not drag Gravity
-     * around. Instead, permit re-acquisition only after three consecutive
-     * quasi-static samples: magnitude within 0.92-1.08 of the learned upright
-     * baseline and sample-to-sample vector change no greater than 0.08 g. The
-     * coordinate-wise median of those three existing filtered XYZ vectors is
-     * then used as the new Gravity orientation. This lets Gravity adapt during
-     * brief trustworthy intervals within a rolling episode without following
-     * sustained translational acceleration.
+     * Once ROLLING has been observed, keep the last trusted Gravity orientation
+     * until three consecutive quasi-static samples are available: magnitude
+     * within 0.92-1.08 of the learned upright baseline and sample-to-sample
+     * vector change no greater than 0.08 g. The coordinate-wise median of those
+     * three existing filtered XYZ vectors is then used as the new Gravity
+     * orientation. This lets Gravity adapt during trustworthy intervals without
+     * following sustained translational acceleration.
      *
      * Before ROLLING has ever been confirmed in the current ACTIVE episode,
      * retain the original conservative confidence-weighted EMA so stationary
      * non-rolling orientation changes remain observable.
      */
     if (m_gravity_rolling_seen &&
-        m_gravity_acquire_ready &&
         (!m_gravity_initial_reanchor_done))
     {
-        const float current_gravity_angle_deg =
-            cart_angle_from_reference_deg (
-                m_gravity_filtered_x,
-                m_gravity_filtered_y,
-                m_gravity_filtered_z,
-                m_upright_x,
-                m_upright_y,
-                m_upright_z);
-
-        const float acquire_gravity_angle_deg =
-            cart_angle_from_reference_deg (
-                m_gravity_acquire_x,
-                m_gravity_acquire_y,
-                m_gravity_acquire_z,
-                m_upright_x,
-                m_upright_y,
-                m_upright_z);
-
-        if (isfinite (current_gravity_angle_deg) &&
-            isfinite (acquire_gravity_angle_deg) &&
-            cart_is_upright (current_gravity_angle_deg) &&
-            (!cart_is_upright (acquire_gravity_angle_deg)))
-        {
-            m_gravity_filtered_x = m_gravity_acquire_x;
-            m_gravity_filtered_y = m_gravity_acquire_y;
-            m_gravity_filtered_z = m_gravity_acquire_z;
-            m_have_gravity_filter = true;
-        }
-
         m_gravity_initial_reanchor_done = true;
         m_gravity_quiet_count = 0U;
     }
