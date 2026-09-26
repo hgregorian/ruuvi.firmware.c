@@ -75,6 +75,17 @@ uint8_t app_comms_bleadv_send_count_get (void);
 void app_comms_bleadv_send_count_set (const uint8_t count);
 
 /**
+ * @brief Return true while the temporary management lease is active.
+ *
+ * This state is exposed in the DumpSense F0 state flags so a controller can
+ * verify that the firmware, rather than only the BLE transport, accepted the
+ * MGMT command.
+ *
+ * @return True while management mode is active.
+ */
+bool app_comms_management_active_get (void);
+
+/**
  * @brief Enable security-sensitive configuration options.
  *
  * After calling this function:

@@ -66,4 +66,30 @@ rd_status_t app_dataformat_encode (uint8_t * const output,
                                    const rd_sensor_data_t * const data,
                                    const app_dataformat_t format);
 
+/**
+ * @brief Encode the unofficial DumpSense 0xF0 payload.
+ *
+ * @param[out] output Buffer to which data is encoded.
+ * @param[in,out] output_length Input: Size of output buffer.
+ *                              Output: Size of encoded data.
+ *
+ * @return RD_SUCCESS on success, error code otherwise.
+ */
+rd_status_t app_dataformat_encode_dumpsense (
+    uint8_t * const output,
+    size_t * const output_length);
+
+/** @return Measurement sequence used by the most recent RAWv2 payload. */
+uint16_t app_dataformat_rawv2_sequence_get (void);
+
+/** Record the result of queuing a RAWv2 advertisement. */
+void app_dataformat_adv_diag_record_raw (
+    const rd_status_t err_code,
+    const uint16_t sequence);
+
+/** Record the result of queuing a DumpSense F0 advertisement. */
+void app_dataformat_adv_diag_record_f0 (
+    const rd_status_t err_code,
+    const uint16_t sequence);
+
 #endif // APP_DATAFORMATS_H
