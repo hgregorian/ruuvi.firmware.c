@@ -97,7 +97,7 @@
 #define CART_DUMP_MIN_HIT_CONFIDENCE (0.75F)
 
 /*
- * Signed-axis DUMP proof of concept.
+ * Signed-axis cart-orientation proof of concept.
  *
  * The cart has one mechanically meaningful forward/backward rotation axis.
  * These tag-coordinate axis components were derived from the 2026-09-26
@@ -105,9 +105,11 @@
  * ~90 deg). Axis sign is chosen so the calibrated forward/dump direction is
  * positive.
  *
- * The POC normalizes acceleration before orientation math, projects gravity
- * onto the plane perpendicular to the cart pivot axis, and filters the signed
- * angular displacement directly. It never feeds the production state machine.
+ * The shared POC orientation generator normalizes acceleration before orientation
+ * math, projects gravity onto the plane perpendicular to the cart pivot axis,
+ * and filters the signed angular displacement directly. Production DUMP remains
+ * independent for A/B comparison; rolling/upright posture consume this shared
+ * cart angle without changing their thresholds, timers, or transition logic.
  */
 #define CART_POC_PIVOT_AXIS_X          (-0.356F)
 #define CART_POC_PIVOT_AXIS_Y          (-0.934F)
@@ -170,7 +172,7 @@ static float m_dump_filtered_y;
 static float m_dump_filtered_z;
 static float m_dump_filter_alpha;
 
-/* Signed-axis DUMP POC state; intentionally independent of production DUMP. */
+/* Signed-axis shared cart-orientation state plus independent POC DUMP state. */
 static bool m_poc_have_filter;
 static bool m_poc_dump_candidate;
 static bool m_poc_dump_latched;
@@ -833,6 +835,48 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
             m_upright_y,
             m_upright_z);
 
+    /*
+     * Shared signed-axis cart orientation.  The raw signed angle replaces the
+     * generic unsigned angle only as the posture input to ROLLING.  The filtered
+     * signed angle is used for the reported UPRIGHT posture.  Existing thresholds
+     * and state-machine timing remain unchanged.  If the signed generator is not
+     * valid yet, fall back to the legacy angle so startup behavior is preserved.
+     */
+    const float poc_raw_angle_deg =
+        cart_poc_signed_angle_deg (x, y, z);
+    const bool poc_raw_angle_valid = isfinite (poc_raw_angle_deg);
+
+    if (poc_raw_angle_valid)
+    {
+        if (!m_poc_have_filter)
+        {
+            /*
+             * Do not seed the shared orientation filter from a low-confidence
+             * first motion sample.  The 13:42 false-positive capture showed
+             * exactly that failure mode: a high-g impulse occurred before the
+             * first trustworthy near-upright sample.
+             */
+            if (confidence >= CART_POC_FILTER_INIT_CONFIDENCE)
+            {
+                m_poc_filtered_angle_deg = poc_raw_angle_deg;
+                m_poc_have_filter = true;
+            }
+        }
+        else
+        {
+            const float effective_alpha =
+                m_dump_filter_alpha * confidence;
+            const float delta_deg =
+                cart_wrap_signed_angle_deg (
+                    poc_raw_angle_deg - m_poc_filtered_angle_deg);
+
+            m_poc_filtered_angle_deg =
+                cart_wrap_signed_angle_deg (
+                    m_poc_filtered_angle_deg +
+                    (effective_alpha * delta_deg));
+        }
+    }
+
     const bool inverted =
         cart_is_inverted (dump_angle_deg);
 
@@ -843,11 +887,15 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
     const bool dump_rearmed =
         cart_is_dump_rearmed (dump_angle_deg);
 
+    const float upright_angle_deg =
+        m_poc_have_filter ? fabsf (m_poc_filtered_angle_deg) : dump_angle_deg;
     const bool upright =
-        cart_is_upright (dump_angle_deg);
+        cart_is_upright (upright_angle_deg);
 
+    const float rolling_angle_deg =
+        poc_raw_angle_valid ? fabsf (poc_raw_angle_deg) : angle_deg;
     const bool rolling =
-        cart_is_rolling (angle_deg);
+        cart_is_rolling (rolling_angle_deg);
 
     bool rolling_evidence = false;
 
@@ -921,49 +969,7 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
             }
         }
     }
-    /*
-     * Signed-axis DUMP proof of concept.
-     *
-     * This path is diagnostic-only. Production dump/upright/rolling/status logic
-     * above remains untouched. The POC uses the same sample cadence, confidence
-     * model, 3-of-4 confirmation, hold time, and re-arm angle so timing changes
-     * come from orientation math rather than a slower decision window.
-     */
-    const float poc_raw_angle_deg =
-        cart_poc_signed_angle_deg (x, y, z);
-    const bool poc_raw_angle_valid = isfinite (poc_raw_angle_deg);
-
-    if (poc_raw_angle_valid)
-    {
-        if (!m_poc_have_filter)
-        {
-            /*
-             * Do not seed the POC filter from a low-confidence first motion
-             * sample. The 13:42 false-positive capture showed exactly that
-             * failure mode: a high-g impulse occurred before the first
-             * trustworthy near-upright sample.
-             */
-            if (confidence >= CART_POC_FILTER_INIT_CONFIDENCE)
-            {
-                m_poc_filtered_angle_deg = poc_raw_angle_deg;
-                m_poc_have_filter = true;
-            }
-        }
-        else
-        {
-            const float effective_alpha =
-                m_dump_filter_alpha * confidence;
-            const float delta_deg =
-                cart_wrap_signed_angle_deg (
-                    poc_raw_angle_deg - m_poc_filtered_angle_deg);
-
-            m_poc_filtered_angle_deg =
-                cart_wrap_signed_angle_deg (
-                    m_poc_filtered_angle_deg +
-                    (effective_alpha * delta_deg));
-        }
-    }
-
+    /* Independent POC DUMP detector consumes the shared signed orientation. */
     const bool poc_dump_evidence =
         m_poc_have_filter &&
         (m_poc_filtered_angle_deg >= CART_DUMP_ANGLE_DEG) &&
