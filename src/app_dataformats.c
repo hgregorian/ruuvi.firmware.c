@@ -272,7 +272,7 @@ rd_status_t app_dataformat_encode (uint8_t * const output,
 
 
 #define DUMPSENSE_FORMAT_ID          (0xF0U)
-#define DUMPSENSE_SCHEMA_VERSION     (0x04U)
+#define DUMPSENSE_SCHEMA_VERSION     (0x05U)
 #define DUMPSENSE_DATA_LENGTH        (24U)
 #define DUMPSENSE_ANGLE_SCALE        (100.0F)
 #define DUMPSENSE_G_SCALE            (1000.0F)
@@ -283,6 +283,11 @@ rd_status_t app_dataformat_encode (uint8_t * const output,
 #define DUMPSENSE_FLAG_ROLLING_CANDIDATE (1U << 3U)
 #define DUMPSENSE_FLAG_ROLLING_EVIDENCE  (1U << 4U)
 #define DUMPSENSE_FLAG_MGMT_ACTIVE       (1U << 5U)
+
+#define DUMPSENSE_POC_FLAG_DUMP_EVIDENCE  (1U << 0U)
+#define DUMPSENSE_POC_FLAG_DUMP_CANDIDATE (1U << 1U)
+#define DUMPSENSE_POC_FLAG_DUMP_LATCHED   (1U << 2U)
+#define DUMPSENSE_POC_FLAG_ANGLE_VALID    (1U << 3U)
 
 static uint8_t m_raw_adv_nomem_count;
 static uint8_t m_f0_adv_nomem_count;
@@ -373,6 +378,38 @@ static uint16_t dumpsense_u16_from_float (
     }
 
     return (uint16_t) lroundf (scaled);
+}
+
+static void dumpsense_put_i16_be (
+    uint8_t * const output,
+    const size_t offset,
+    const int16_t value)
+{
+    const uint16_t encoded = (uint16_t) value;
+    output[offset] = (uint8_t) ((encoded >> 8U) & 0xFFU);
+    output[offset + 1U] = (uint8_t) (encoded & 0xFFU);
+}
+
+static int16_t dumpsense_i16_from_float (
+    const float value,
+    const float scale)
+{
+    if (!isfinite (value))
+    {
+        return 0;
+    }
+
+    const float scaled = value * scale;
+    if (scaled >= 32767.0F)
+    {
+        return INT16_MAX;
+    }
+    if (scaled <= -32768.0F)
+    {
+        return INT16_MIN;
+    }
+
+    return (int16_t) lroundf (scaled);
 }
 
 uint16_t app_dataformat_rawv2_sequence_get (void)
@@ -481,14 +518,12 @@ rd_status_t app_dataformat_encode_dumpsense (
     output[11] = state_flags;
 
     /*
-     * Schema 4 keeps the schema 3 fields through byte 13 unchanged and
-     * reserves the former diagnostic field:
+     * Schema 5 keeps the production schema-4 fields through byte 13 unchanged:
      *
      *   12      While DUMP is latched: assertion age in 100 ms ticks.
      *           Otherwise: DUMP candidate hits (high nibble) / samples
      *           (low nibble).
      *   13      ROLLING evidence in 100 ms ticks.
-     *   14..15  Reserved.
      *
      * DUMP candidate hits/samples are bounded by the four-sample confirmation
      * window. DUMP assertion age saturates at 25.5 seconds, comfortably beyond
@@ -515,24 +550,72 @@ rd_status_t app_dataformat_encode_dumpsense (
     output[13] = (uint8_t) rolling_ticks;
 
     /*
-     * Bytes 16..23: advertising queue diagnostics.
+     * Schema 5 signed-axis DUMP POC diagnostics.
      *
-     *   16      RAWv2 RD_ERROR_NO_MEM count
-     *   17      F0 RD_ERROR_NO_MEM count
-     *   18      RAWv2 other advertising error count
-     *   19      F0 other advertising error count
-     *   20..21  Last RAWv2 advertising failure sequence
-     *   22..23  Last F0 advertising failure sequence
+     *   14..15  POC raw signed cart angle, int16, degrees * 100.
+     *   16..17  POC filtered signed cart angle, int16, degrees * 100.
+     *   18      POC flags: evidence/candidate/latched/angle-valid.
+     *   19      While POC DUMP is latched: assertion age in 100 ms ticks.
+     *           Otherwise: POC candidate hits (high nibble) / samples
+     *           (low nibble).
      *
-     * Counts saturate at 255. A last-failure sequence of 0xFFFF means that
-     * format has not had an advertising send failure since boot.
+     * The POC is diagnostic-only and does not change the production state byte.
      */
-    output[16] = m_raw_adv_nomem_count;
-    output[17] = m_f0_adv_nomem_count;
-    output[18] = m_raw_adv_other_error_count;
-    output[19] = m_f0_adv_other_error_count;
-    dumpsense_put_u16_be (output, 20U, m_raw_adv_last_fail_sequence);
-    dumpsense_put_u16_be (output, 22U, m_f0_adv_last_fail_sequence);
+    dumpsense_put_i16_be (
+        output,
+        14U,
+        dumpsense_i16_from_float (
+            telemetry.poc_raw_angle_deg,
+            DUMPSENSE_ANGLE_SCALE));
+
+    dumpsense_put_i16_be (
+        output,
+        16U,
+        dumpsense_i16_from_float (
+            telemetry.poc_filtered_angle_deg,
+            DUMPSENSE_ANGLE_SCALE));
+
+    uint8_t poc_flags = 0U;
+    if (telemetry.poc_dump_evidence)
+    {
+        poc_flags |= DUMPSENSE_POC_FLAG_DUMP_EVIDENCE;
+    }
+    if (telemetry.poc_dump_candidate)
+    {
+        poc_flags |= DUMPSENSE_POC_FLAG_DUMP_CANDIDATE;
+    }
+    if (telemetry.poc_dump_latched)
+    {
+        poc_flags |= DUMPSENSE_POC_FLAG_DUMP_LATCHED;
+    }
+    if (telemetry.poc_angle_valid)
+    {
+        poc_flags |= DUMPSENSE_POC_FLAG_ANGLE_VALID;
+    }
+    output[18] = poc_flags;
+
+    if (telemetry.poc_dump_latched)
+    {
+        output[19] = telemetry.poc_dump_age_ticks;
+    }
+    else
+    {
+        output[19] =
+            (uint8_t) (
+                ((telemetry.poc_dump_candidate_hits & 0x0FU) << 4U) |
+                (telemetry.poc_dump_candidate_samples & 0x0FU));
+    }
+
+    /*
+     * Preserve the four cumulative advertising queue/error counters in schema 5.
+     * The schema-4 last-failure sequence fields are temporarily omitted to make
+     * room for the POC without increasing the 24-byte F0 payload or adding a
+     * third advertisement per heartbeat.
+     */
+    output[20] = m_raw_adv_nomem_count;
+    output[21] = m_f0_adv_nomem_count;
+    output[22] = m_raw_adv_other_error_count;
+    output[23] = m_f0_adv_other_error_count;
 
     *output_length = DUMPSENSE_DATA_LENGTH;
     return RD_SUCCESS;

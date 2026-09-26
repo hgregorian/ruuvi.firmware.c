@@ -97,6 +97,25 @@
 #define CART_DUMP_MIN_HIT_CONFIDENCE (0.75F)
 
 /*
+ * Signed-axis DUMP proof of concept.
+ *
+ * The cart has one mechanically meaningful forward/backward rotation axis.
+ * These tag-coordinate axis components were derived from the 2026-09-26
+ * stationary calibration (upright -> forward ~90 deg -> upright -> backward
+ * ~90 deg). Axis sign is chosen so the calibrated forward/dump direction is
+ * positive.
+ *
+ * The POC normalizes acceleration before orientation math, projects gravity
+ * onto the plane perpendicular to the cart pivot axis, and filters the signed
+ * angular displacement directly. It never feeds the production state machine.
+ */
+#define CART_POC_PIVOT_AXIS_X          (-0.356F)
+#define CART_POC_PIVOT_AXIS_Y          (-0.934F)
+#define CART_POC_PIVOT_AXIS_Z          (-0.032F)
+#define CART_POC_MIN_PROJECTED_MAG      (0.10F)
+#define CART_POC_FILTER_INIT_CONFIDENCE CART_DUMP_MIN_HIT_CONFIDENCE
+
+/*
  * Allow a latched DUMP to re-arm once the filtered acceleration vector returns
  * within CART_DUMP_REARM_ANGLE_DEG of the upright reference vector.
  */
@@ -151,6 +170,17 @@ static float m_dump_filtered_y;
 static float m_dump_filtered_z;
 static float m_dump_filter_alpha;
 
+/* Signed-axis DUMP POC state; intentionally independent of production DUMP. */
+static bool m_poc_have_filter;
+static bool m_poc_dump_candidate;
+static bool m_poc_dump_latched;
+static bool m_poc_dump_armed;
+static uint8_t m_poc_dump_candidate_samples;
+static uint8_t m_poc_dump_candidate_hits;
+static uint64_t m_poc_dump_asserted_ms;
+static uint64_t m_poc_dump_min_hold_until_ms;
+static float m_poc_filtered_angle_deg;
+
 static uint64_t m_last_motion_ms;
 static uint64_t m_motion_guard_until_ms;
 static uint8_t m_dump_candidate_samples;
@@ -200,6 +230,110 @@ static float cart_angle_from_reference_deg (const float x,
     }
 
     return acosf (cosine) * (180.0F / M_PI);
+}
+
+static float cart_wrap_signed_angle_deg (float angle_deg)
+{
+    while (angle_deg > 180.0F)
+    {
+        angle_deg -= 360.0F;
+    }
+
+    while (angle_deg <= -180.0F)
+    {
+        angle_deg += 360.0F;
+    }
+
+    return angle_deg;
+}
+
+/*
+ * Return the signed cart rotation about the calibrated pivot axis.
+ *
+ * Acceleration magnitude is deliberately removed before the orientation math:
+ * magnitude controls confidence elsewhere; it must not give a high-g impulse
+ * extra geometric leverage over the orientation estimate.
+ */
+static float cart_poc_signed_angle_deg (const float x,
+                                        const float y,
+                                        const float z)
+{
+    const float sample_mag = sqrtf ((x * x) + (y * y) + (z * z));
+
+    if ((sample_mag <= 0.0F) || (m_upright_mag <= 0.0F))
+    {
+        return NAN;
+    }
+
+    const float axis_mag =
+        sqrtf ((CART_POC_PIVOT_AXIS_X * CART_POC_PIVOT_AXIS_X) +
+               (CART_POC_PIVOT_AXIS_Y * CART_POC_PIVOT_AXIS_Y) +
+               (CART_POC_PIVOT_AXIS_Z * CART_POC_PIVOT_AXIS_Z));
+
+    if (axis_mag <= 0.0F)
+    {
+        return NAN;
+    }
+
+    const float ax = CART_POC_PIVOT_AXIS_X / axis_mag;
+    const float ay = CART_POC_PIVOT_AXIS_Y / axis_mag;
+    const float az = CART_POC_PIVOT_AXIS_Z / axis_mag;
+
+    const float sx = x / sample_mag;
+    const float sy = y / sample_mag;
+    const float sz = z / sample_mag;
+
+    const float ux = m_upright_x / m_upright_mag;
+    const float uy = m_upright_y / m_upright_mag;
+    const float uz = m_upright_z / m_upright_mag;
+
+    const float sample_axis_dot = (sx * ax) + (sy * ay) + (sz * az);
+    const float upright_axis_dot = (ux * ax) + (uy * ay) + (uz * az);
+
+    float spx = sx - (sample_axis_dot * ax);
+    float spy = sy - (sample_axis_dot * ay);
+    float spz = sz - (sample_axis_dot * az);
+
+    float upx = ux - (upright_axis_dot * ax);
+    float upy = uy - (upright_axis_dot * ay);
+    float upz = uz - (upright_axis_dot * az);
+
+    const float sample_projected_mag =
+        sqrtf ((spx * spx) + (spy * spy) + (spz * spz));
+    const float upright_projected_mag =
+        sqrtf ((upx * upx) + (upy * upy) + (upz * upz));
+
+    if ((sample_projected_mag < CART_POC_MIN_PROJECTED_MAG) ||
+        (upright_projected_mag < CART_POC_MIN_PROJECTED_MAG))
+    {
+        return NAN;
+    }
+
+    spx /= sample_projected_mag;
+    spy /= sample_projected_mag;
+    spz /= sample_projected_mag;
+    upx /= upright_projected_mag;
+    upy /= upright_projected_mag;
+    upz /= upright_projected_mag;
+
+    const float cross_x = (upy * spz) - (upz * spy);
+    const float cross_y = (upz * spx) - (upx * spz);
+    const float cross_z = (upx * spy) - (upy * spx);
+
+    const float sin_angle =
+        (ax * cross_x) + (ay * cross_y) + (az * cross_z);
+    float cos_angle = (upx * spx) + (upy * spy) + (upz * spz);
+
+    if (cos_angle > 1.0F)
+    {
+        cos_angle = 1.0F;
+    }
+    else if (cos_angle < -1.0F)
+    {
+        cos_angle = -1.0F;
+    }
+
+    return atan2f (sin_angle, cos_angle) * (180.0F / M_PI);
 }
 
 static void cart_sample_metrics_get (const float x,
@@ -283,6 +417,33 @@ static uint8_t cart_dump_age_ticks_get (const uint64_t now_ms)
     return (uint8_t) ((age_ticks > 0xFFU) ? 0xFFU : age_ticks);
 }
 
+static void cart_poc_dump_candidate_reset (void)
+{
+    m_poc_dump_candidate = false;
+    m_poc_dump_candidate_samples = 0U;
+    m_poc_dump_candidate_hits = 0U;
+}
+
+static void cart_poc_dump_candidate_start (void)
+{
+    m_poc_dump_candidate = true;
+    m_poc_dump_candidate_samples = 1U;
+    m_poc_dump_candidate_hits = 1U;
+}
+
+static uint8_t cart_poc_dump_age_ticks_get (const uint64_t now_ms)
+{
+    if (!m_poc_dump_latched)
+    {
+        return 0U;
+    }
+
+    const uint64_t age_ticks =
+        (now_ms - m_poc_dump_asserted_ms) / CART_DUMP_AGE_TICK_MS;
+
+    return (uint8_t) ((age_ticks > 0xFFU) ? 0xFFU : age_ticks);
+}
+
 static void cart_idle_timer_restart (void)
 {
     m_idle_restore_pending = false;
@@ -338,6 +499,14 @@ static void cart_idle (void * p_event, uint16_t event_size)
         m_dump_armed = true;
     }
 
+    if (m_poc_dump_latched)
+    {
+        m_poc_dump_latched = false;
+        m_poc_dump_asserted_ms = 0U;
+    }
+    cart_poc_dump_candidate_reset();
+    m_poc_dump_armed = true;
+
     /*
      * Stop motion evaluation before taking the final sample so the final
      * heartbeat cannot restart the inactivity timer.
@@ -345,6 +514,7 @@ static void cart_idle (void * p_event, uint16_t event_size)
     m_active = false;
     m_have_previous_sample = false;
     m_have_dump_filter = false;
+    m_poc_have_filter = false;
     m_rolling_candidate = false;
     m_rolling = false;
     m_rolling_evidence_ms = 0U;
@@ -355,6 +525,7 @@ static void cart_idle (void * p_event, uint16_t event_size)
      * the other derived telemetry values.
      */
     m_telemetry.dump_evidence = false;
+    m_telemetry.poc_dump_evidence = false;
     m_telemetry.rolling_evidence = false;
 
     /*
@@ -414,6 +585,7 @@ static void cart_motion (void * p_event, uint16_t event_size)
         m_active = true;
         m_have_previous_sample = false;
         m_have_dump_filter = false;
+        m_poc_have_filter = false;
 
         /*
          * Generate fresh telemetry immediately rather than waiting for the
@@ -438,10 +610,18 @@ rd_status_t app_cart_motion_init (void)
         m_have_previous_sample = false;
         m_have_upright_sample = false;
         m_have_dump_filter = false;
+        m_poc_have_filter = false;
 
         cart_dump_candidate_reset();
         m_dump_latched = false;
         m_dump_armed = true;
+
+        cart_poc_dump_candidate_reset();
+        m_poc_dump_latched = false;
+        m_poc_dump_armed = true;
+        m_poc_dump_asserted_ms = 0U;
+        m_poc_dump_min_hold_until_ms = 0U;
+        m_poc_filtered_angle_deg = 0.0F;
 
         m_last_motion_ms = 0U;
         m_motion_guard_until_ms = 0U;
@@ -583,6 +763,15 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
             m_telemetry.filtered_angle_deg = angle_deg;
             m_telemetry.sample_g = sample_g;
             m_telemetry.confidence = confidence;
+            m_telemetry.poc_angle_valid = false;
+            m_telemetry.poc_dump_candidate = m_poc_dump_candidate;
+            m_telemetry.poc_dump_evidence = false;
+            m_telemetry.poc_dump_latched = m_poc_dump_latched;
+            m_telemetry.poc_dump_candidate_hits = m_poc_dump_candidate_hits;
+            m_telemetry.poc_dump_candidate_samples = m_poc_dump_candidate_samples;
+            m_telemetry.poc_dump_age_ticks = 0U;
+            m_telemetry.poc_raw_angle_deg = 0.0F;
+            m_telemetry.poc_filtered_angle_deg = 0.0F;
         }
 
         return;
@@ -732,6 +921,109 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
             }
         }
     }
+    /*
+     * Signed-axis DUMP proof of concept.
+     *
+     * This path is diagnostic-only. Production dump/upright/rolling/status logic
+     * above remains untouched. The POC uses the same sample cadence, confidence
+     * model, 3-of-4 confirmation, hold time, and re-arm angle so timing changes
+     * come from orientation math rather than a slower decision window.
+     */
+    const float poc_raw_angle_deg =
+        cart_poc_signed_angle_deg (x, y, z);
+    const bool poc_raw_angle_valid = isfinite (poc_raw_angle_deg);
+
+    if (poc_raw_angle_valid)
+    {
+        if (!m_poc_have_filter)
+        {
+            /*
+             * Do not seed the POC filter from a low-confidence first motion
+             * sample. The 13:42 false-positive capture showed exactly that
+             * failure mode: a high-g impulse occurred before the first
+             * trustworthy near-upright sample.
+             */
+            if (confidence >= CART_POC_FILTER_INIT_CONFIDENCE)
+            {
+                m_poc_filtered_angle_deg = poc_raw_angle_deg;
+                m_poc_have_filter = true;
+            }
+        }
+        else
+        {
+            const float effective_alpha =
+                m_dump_filter_alpha * confidence;
+            const float delta_deg =
+                cart_wrap_signed_angle_deg (
+                    poc_raw_angle_deg - m_poc_filtered_angle_deg);
+
+            m_poc_filtered_angle_deg =
+                cart_wrap_signed_angle_deg (
+                    m_poc_filtered_angle_deg +
+                    (effective_alpha * delta_deg));
+        }
+    }
+
+    const bool poc_dump_evidence =
+        m_poc_have_filter &&
+        (m_poc_filtered_angle_deg >= CART_DUMP_ANGLE_DEG) &&
+        (confidence >= CART_DUMP_MIN_HIT_CONFIDENCE);
+
+    const bool poc_dump_rearmed =
+        m_poc_have_filter &&
+        (fabsf (m_poc_filtered_angle_deg) <= CART_DUMP_REARM_ANGLE_DEG);
+
+    if (m_poc_dump_latched)
+    {
+        if ((now_ms >= m_poc_dump_min_hold_until_ms) && poc_dump_rearmed)
+        {
+            m_poc_dump_latched = false;
+            m_poc_dump_asserted_ms = 0U;
+            m_poc_dump_armed = true;
+        }
+    }
+    else if (m_poc_dump_armed)
+    {
+        if (!m_poc_dump_candidate)
+        {
+            if (poc_dump_evidence)
+            {
+                cart_poc_dump_candidate_start();
+            }
+        }
+        else
+        {
+            m_poc_dump_candidate_samples++;
+
+            if (poc_dump_evidence)
+            {
+                m_poc_dump_candidate_hits++;
+            }
+
+            if (m_poc_dump_candidate_samples >= CART_DUMP_CONFIRM_SAMPLES)
+            {
+                if (m_poc_dump_candidate_hits >= CART_DUMP_REQUIRED_HITS)
+                {
+                    cart_poc_dump_candidate_reset();
+                    m_poc_dump_latched = true;
+                    m_poc_dump_asserted_ms = now_ms;
+                    m_poc_dump_armed = false;
+                    m_poc_dump_min_hold_until_ms =
+                        now_ms + CART_DUMP_ACTIVE_HOLD_MS;
+                }
+                else
+                {
+                    cart_poc_dump_candidate_reset();
+
+                    if (poc_dump_evidence)
+                    {
+                        cart_poc_dump_candidate_start();
+                    }
+                }
+            }
+        }
+    }
+
     if (m_have_previous_sample)
     {
         const float dx = x - m_previous_x;
@@ -820,6 +1112,17 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
     m_telemetry.filtered_angle_deg = dump_angle_deg;
     m_telemetry.sample_g = sample_g;
     m_telemetry.confidence = confidence;
+    m_telemetry.poc_angle_valid = m_poc_have_filter && poc_raw_angle_valid;
+    m_telemetry.poc_dump_candidate = m_poc_dump_candidate;
+    m_telemetry.poc_dump_evidence = poc_dump_evidence;
+    m_telemetry.poc_dump_latched = m_poc_dump_latched;
+    m_telemetry.poc_dump_candidate_hits = m_poc_dump_candidate_hits;
+    m_telemetry.poc_dump_candidate_samples = m_poc_dump_candidate_samples;
+    m_telemetry.poc_dump_age_ticks = cart_poc_dump_age_ticks_get (now_ms);
+    m_telemetry.poc_raw_angle_deg =
+        poc_raw_angle_valid ? poc_raw_angle_deg : 0.0F;
+    m_telemetry.poc_filtered_angle_deg =
+        m_poc_have_filter ? m_poc_filtered_angle_deg : 0.0F;
 
     m_previous_x = x;
     m_previous_y = y;
@@ -862,8 +1165,17 @@ bool app_cart_motion_telemetry_get (
     p_telemetry->status = app_cart_motion_status_get();
     p_telemetry->dump_candidate_hits = m_dump_candidate_hits;
     p_telemetry->dump_candidate_samples = m_dump_candidate_samples;
+    const uint64_t now_ms = ri_rtc_millis();
     p_telemetry->dump_age_ticks =
-        cart_dump_age_ticks_get (ri_rtc_millis());
+        cart_dump_age_ticks_get (now_ms);
     p_telemetry->rolling_evidence_ms = m_rolling_evidence_ms;
+    p_telemetry->poc_angle_valid =
+        m_poc_have_filter && m_telemetry.poc_angle_valid;
+    p_telemetry->poc_dump_candidate = m_poc_dump_candidate;
+    p_telemetry->poc_dump_latched = m_poc_dump_latched;
+    p_telemetry->poc_dump_candidate_hits = m_poc_dump_candidate_hits;
+    p_telemetry->poc_dump_candidate_samples = m_poc_dump_candidate_samples;
+    p_telemetry->poc_dump_age_ticks =
+        cart_poc_dump_age_ticks_get (now_ms);
     return m_telemetry.valid;
 }
