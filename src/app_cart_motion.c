@@ -137,7 +137,7 @@
  */
 #define CART_SAMPLE_MOTION_G          (0.050F)
 #define CART_SAMPLE_MOTION_G2         (CART_SAMPLE_MOTION_G * CART_SAMPLE_MOTION_G)
-#define CART_ROLLING_CONFIRM_MS       (3U * 1000U)
+#define CART_ROLLING_CONFIRM_MS       (2U * 1000U)
 #define CART_ROLLING_GAP_TOLERANCE_MS (2000U)
 
 /*
@@ -874,10 +874,9 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
     const bool upright =
         cart_is_upright (tilt_angle_deg);
 
-    const float rolling_angle_deg =
-        pitch_valid ? fabsf (pitch_deg) : tilt_deg;
     const bool rolling =
-        cart_is_rolling (rolling_angle_deg);
+        m_pitch_have_filter &&
+        cart_is_rolling (fabsf (m_pitch_filtered_deg));
 
     bool rolling_evidence = false;
 
