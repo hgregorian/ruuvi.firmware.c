@@ -108,8 +108,9 @@
  * The shared POC orientation generator normalizes acceleration before orientation
  * math, projects gravity onto the plane perpendicular to the cart pivot axis,
  * and filters the signed angular displacement directly. Production DUMP remains
- * independent for A/B comparison; rolling/upright posture consume this shared
- * cart angle without changing their thresholds, timers, or transition logic.
+ * independent for A/B comparison; rolling posture consumes this shared cart
+ * angle without changing its thresholds, timers, or transition logic. UPRIGHT
+ * continues to use total filtered 3-D tilt from the homed upright vector.
  */
 #define CART_POC_PIVOT_AXIS_X          (-0.356F)
 #define CART_POC_PIVOT_AXIS_Y          (-0.934F)
@@ -826,7 +827,7 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
             effective_alpha * (z - m_dump_filtered_z);
     }
 
-    const float dump_angle_deg =
+    const float tilt_angle_deg =
         cart_angle_from_reference_deg (
             m_dump_filtered_x,
             m_dump_filtered_y,
@@ -836,11 +837,10 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
             m_upright_z);
 
     /*
-     * Shared signed-axis cart orientation.  The raw signed angle replaces the
-     * generic unsigned angle only as the posture input to ROLLING.  The filtered
-     * signed angle is used for the reported UPRIGHT posture.  Existing thresholds
-     * and state-machine timing remain unchanged.  If the signed generator is not
-     * valid yet, fall back to the legacy angle so startup behavior is preserved.
+     * Shared signed-axis cart orientation. The raw signed angle replaces the
+     * generic unsigned angle only as the posture input to ROLLING. UPRIGHT keeps
+     * using total filtered 3-D tilt from the homed upright vector so side lean
+     * remains visible. Existing thresholds and state-machine timing are unchanged.
      */
     const float poc_raw_angle_deg =
         cart_poc_signed_angle_deg (x, y, z);
@@ -878,19 +878,17 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
     }
 
     const bool inverted =
-        cart_is_inverted (dump_angle_deg);
+        cart_is_inverted (tilt_angle_deg);
 
     const bool dump_evidence =
         inverted &&
         (confidence >= CART_DUMP_MIN_HIT_CONFIDENCE);
 
     const bool dump_rearmed =
-        cart_is_dump_rearmed (dump_angle_deg);
+        cart_is_dump_rearmed (tilt_angle_deg);
 
-    const float upright_angle_deg =
-        m_poc_have_filter ? fabsf (m_poc_filtered_angle_deg) : dump_angle_deg;
     const bool upright =
-        cart_is_upright (upright_angle_deg);
+        cart_is_upright (tilt_angle_deg);
 
     const float rolling_angle_deg =
         poc_raw_angle_valid ? fabsf (poc_raw_angle_deg) : angle_deg;
@@ -1115,7 +1113,7 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
     m_telemetry.dump_age_ticks = cart_dump_age_ticks_get (now_ms);
     m_telemetry.rolling_evidence_ms = m_rolling_evidence_ms;
     m_telemetry.raw_angle_deg = angle_deg;
-    m_telemetry.filtered_angle_deg = dump_angle_deg;
+    m_telemetry.filtered_angle_deg = tilt_angle_deg;
     m_telemetry.sample_g = sample_g;
     m_telemetry.confidence = confidence;
     m_telemetry.poc_angle_valid = m_poc_have_filter && poc_raw_angle_valid;
