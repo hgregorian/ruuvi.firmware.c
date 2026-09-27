@@ -272,7 +272,7 @@ rd_status_t app_dataformat_encode (uint8_t * const output,
 
 
 #define DUMPSENSE_FORMAT_ID          (0xF0U)
-#define DUMPSENSE_SCHEMA_VERSION     (0x05U)
+#define DUMPSENSE_SCHEMA_VERSION     (0x06U)
 #define DUMPSENSE_DATA_LENGTH        (24U)
 #define DUMPSENSE_ANGLE_SCALE        (100.0F)
 #define DUMPSENSE_G_SCALE            (1000.0F)
@@ -284,10 +284,8 @@ rd_status_t app_dataformat_encode (uint8_t * const output,
 #define DUMPSENSE_FLAG_ROLLING_EVIDENCE  (1U << 4U)
 #define DUMPSENSE_FLAG_MGMT_ACTIVE       (1U << 5U)
 
-#define DUMPSENSE_POC_FLAG_DUMP_EVIDENCE  (1U << 0U)
-#define DUMPSENSE_POC_FLAG_DUMP_CANDIDATE (1U << 1U)
-#define DUMPSENSE_POC_FLAG_DUMP_LATCHED   (1U << 2U)
-#define DUMPSENSE_POC_FLAG_ANGLE_VALID    (1U << 3U)
+#define DUMPSENSE_FLAG_PITCH_VALID       (1U << 6U)
+#define DUMPSENSE_FLAG_ROLL_VALID        (1U << 7U)
 
 static uint8_t m_raw_adv_nomem_count;
 static uint8_t m_f0_adv_nomem_count;
@@ -451,14 +449,14 @@ rd_status_t app_dataformat_encode_dumpsense (
         output,
         4U,
         dumpsense_u16_from_float (
-            telemetry.raw_angle_deg,
+            telemetry.tilt_deg,
             DUMPSENSE_ANGLE_SCALE));
 
     dumpsense_put_u16_be (
         output,
         6U,
         dumpsense_u16_from_float (
-            telemetry.filtered_angle_deg,
+            telemetry.tilt_filtered_deg,
             DUMPSENSE_ANGLE_SCALE));
 
     dumpsense_put_u16_be (
@@ -515,10 +513,18 @@ rd_status_t app_dataformat_encode_dumpsense (
     {
         state_flags |= DUMPSENSE_FLAG_MGMT_ACTIVE;
     }
+    if (telemetry.pitch_valid)
+    {
+        state_flags |= DUMPSENSE_FLAG_PITCH_VALID;
+    }
+    if (telemetry.roll_valid)
+    {
+        state_flags |= DUMPSENSE_FLAG_ROLL_VALID;
+    }
     output[11] = state_flags;
 
     /*
-     * Schema 5 keeps the production schema-4 fields through byte 13 unchanged:
+     * Schema 6 keeps the production fields through byte 13 unchanged:
      *
      *   12      While DUMP is latched: assertion age in 100 ms ticks.
      *           Otherwise: DUMP candidate hits (high nibble) / samples
@@ -550,72 +556,62 @@ rd_status_t app_dataformat_encode_dumpsense (
     output[13] = (uint8_t) rolling_ticks;
 
     /*
-     * Schema 5 signed-axis DUMP POC diagnostics.
+     * Schema 6 cart orientation coordinates.
      *
-     *   14..15  POC raw signed cart angle, int16, degrees * 100.
-     *   16..17  POC filtered signed cart angle, int16, degrees * 100.
-     *   18      POC flags: evidence/candidate/latched/angle-valid.
-     *   19      While POC DUMP is latched: assertion age in 100 ms ticks.
-     *           Otherwise: POC candidate hits (high nibble) / samples
-     *           (low nibble).
+     *   14..15  Pitch, raw, int16 degrees * 100.
+     *   16..17  Pitch, filtered, int16 degrees * 100.
+     *   18..19  Roll, raw, int16 degrees * 100.
+     *   20..21  Roll, filtered, int16 degrees * 100.
      *
-     * The POC is diagnostic-only and does not change the production state byte.
+     * Pitch and roll are canonical wrapped angles in (-180, +180]. Their raw
+     * validity bits are carried in state_flags bits 6 and 7 respectively.
      */
     dumpsense_put_i16_be (
         output,
         14U,
         dumpsense_i16_from_float (
-            telemetry.poc_raw_angle_deg,
+            telemetry.pitch_deg,
             DUMPSENSE_ANGLE_SCALE));
 
     dumpsense_put_i16_be (
         output,
         16U,
         dumpsense_i16_from_float (
-            telemetry.poc_filtered_angle_deg,
+            telemetry.pitch_filtered_deg,
             DUMPSENSE_ANGLE_SCALE));
 
-    uint8_t poc_flags = 0U;
-    if (telemetry.poc_dump_evidence)
-    {
-        poc_flags |= DUMPSENSE_POC_FLAG_DUMP_EVIDENCE;
-    }
-    if (telemetry.poc_dump_candidate)
-    {
-        poc_flags |= DUMPSENSE_POC_FLAG_DUMP_CANDIDATE;
-    }
-    if (telemetry.poc_dump_latched)
-    {
-        poc_flags |= DUMPSENSE_POC_FLAG_DUMP_LATCHED;
-    }
-    if (telemetry.poc_angle_valid)
-    {
-        poc_flags |= DUMPSENSE_POC_FLAG_ANGLE_VALID;
-    }
-    output[18] = poc_flags;
+    dumpsense_put_i16_be (
+        output,
+        18U,
+        dumpsense_i16_from_float (
+            telemetry.roll_deg,
+            DUMPSENSE_ANGLE_SCALE));
 
-    if (telemetry.poc_dump_latched)
-    {
-        output[19] = telemetry.poc_dump_age_ticks;
-    }
-    else
-    {
-        output[19] =
-            (uint8_t) (
-                ((telemetry.poc_dump_candidate_hits & 0x0FU) << 4U) |
-                (telemetry.poc_dump_candidate_samples & 0x0FU));
-    }
+    dumpsense_put_i16_be (
+        output,
+        20U,
+        dumpsense_i16_from_float (
+            telemetry.roll_filtered_deg,
+            DUMPSENSE_ANGLE_SCALE));
 
     /*
-     * Preserve the four cumulative advertising queue/error counters in schema 5.
-     * The schema-4 last-failure sequence fields are temporarily omitted to make
-     * room for the POC without increasing the 24-byte F0 payload or adding a
-     * third advertisement per heartbeat.
+     * The fixed 24-byte payload leaves two bytes for advertising diagnostics.
+     * Preserve all four cumulative counters as saturating 4-bit values:
+     *
+     *   22 high  RAWv2 queue-full count; low  RAWv2 other-error count.
+     *   23 high  F0 queue-full count;    low  F0 other-error count.
      */
-    output[20] = m_raw_adv_nomem_count;
-    output[21] = m_f0_adv_nomem_count;
-    output[22] = m_raw_adv_other_error_count;
-    output[23] = m_f0_adv_other_error_count;
+    const uint8_t raw_nomem_q4 =
+        (m_raw_adv_nomem_count > 0x0FU) ? 0x0FU : m_raw_adv_nomem_count;
+    const uint8_t raw_other_q4 =
+        (m_raw_adv_other_error_count > 0x0FU) ? 0x0FU : m_raw_adv_other_error_count;
+    const uint8_t f0_nomem_q4 =
+        (m_f0_adv_nomem_count > 0x0FU) ? 0x0FU : m_f0_adv_nomem_count;
+    const uint8_t f0_other_q4 =
+        (m_f0_adv_other_error_count > 0x0FU) ? 0x0FU : m_f0_adv_other_error_count;
+
+    output[22] = (uint8_t) ((raw_nomem_q4 << 4U) | raw_other_q4);
+    output[23] = (uint8_t) ((f0_nomem_q4 << 4U) | f0_other_q4);
 
     *output_length = DUMPSENSE_DATA_LENGTH;
     return RD_SUCCESS;

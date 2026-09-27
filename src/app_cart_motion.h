@@ -24,30 +24,21 @@ typedef struct
     bool rolling_candidate;
     bool rolling_evidence;
     bool upright;
+    bool pitch_valid;
+    bool roll_valid;
     uint8_t status;
     uint8_t dump_candidate_hits;
     uint8_t dump_candidate_samples;
     uint8_t dump_age_ticks;
     uint32_t rolling_evidence_ms;
-    float raw_angle_deg;
-    float filtered_angle_deg;
+    float tilt_deg;
+    float tilt_filtered_deg;
+    float pitch_deg;
+    float pitch_filtered_deg;
+    float roll_deg;
+    float roll_filtered_deg;
     float sample_g;
     float confidence;
-
-    /*
-     * Signed-axis dump detector POC diagnostics. These fields are deliberately
-     * parallel to the production detector and do not affect status, upright,
-     * rolling, active/idle, or the production DUMP latch.
-     */
-    bool poc_angle_valid;
-    bool poc_dump_candidate;
-    bool poc_dump_evidence;
-    bool poc_dump_latched;
-    uint8_t poc_dump_candidate_hits;
-    uint8_t poc_dump_candidate_samples;
-    uint8_t poc_dump_age_ticks;
-    float poc_raw_angle_deg;
-    float poc_filtered_angle_deg;
 } app_cart_motion_telemetry_t;
 
 /*

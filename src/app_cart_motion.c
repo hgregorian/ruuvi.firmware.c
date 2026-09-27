@@ -50,7 +50,7 @@
  *
  * The effective EMA coefficient is calculated from the active sample interval:
  *
- *     alpha = 1 - exp(-sample_interval / CART_DUMP_FILTER_TAU_MS)
+ *     alpha = 1 - exp(-sample_interval / CART_ORIENTATION_FILTER_TAU_MS)
  *
  * With CART_ANALYSIS_INTERVAL_MS = 100 ms and TAU = 280 ms:
  *
@@ -76,7 +76,7 @@
  * Because alpha is derived from the sample interval, changing the active
  * sampling rate preserves approximately the same real-world filter response.
  */
-#define CART_DUMP_FILTER_TAU_MS     (280.0F)
+#define CART_ORIENTATION_FILTER_TAU_MS     (280.0F)
 
 /*
  * High-g samples are more likely to be dominated by impact / translational
@@ -97,26 +97,25 @@
 #define CART_DUMP_MIN_HIT_CONFIDENCE (0.75F)
 
 /*
- * Signed-axis cart-orientation proof of concept.
+ * Cart-fixed orientation axes in tag coordinates.
  *
- * The cart has one mechanically meaningful forward/backward rotation axis.
- * These tag-coordinate axis components were derived from the 2026-09-26
- * stationary calibration (upright -> forward ~90 deg -> upright -> backward
- * ~90 deg). Axis sign is chosen so the calibrated forward/dump direction is
- * positive.
+ * Pitch was calibrated from stationary upright -> forward ~90 deg -> upright ->
+ * backward ~90 deg captures. Positive pitch is the normal forward/dump direction.
  *
- * The shared POC orientation generator normalizes acceleration before orientation
- * math, projects gravity onto the plane perpendicular to the cart pivot axis,
- * and filters the signed angular displacement directly. Production DUMP remains
- * independent for A/B comparison; rolling posture consumes this shared cart
- * angle without changing its thresholds, timers, or transition logic. UPRIGHT
- * continues to use total filtered 3-D tilt from the homed upright vector.
+ * Roll was calibrated from stationary left-side-down -> upright ->
+ * right-side-down captures, viewed from behind the cart handle. Positive roll is
+ * left side down; negative roll is right side down.
+ *
+ * Both angles are normalized to (-180, +180] degrees.
  */
-#define CART_POC_PIVOT_AXIS_X          (-0.356F)
-#define CART_POC_PIVOT_AXIS_Y          (-0.934F)
-#define CART_POC_PIVOT_AXIS_Z          (-0.032F)
-#define CART_POC_MIN_PROJECTED_MAG      (0.10F)
-#define CART_POC_FILTER_INIT_CONFIDENCE CART_DUMP_MIN_HIT_CONFIDENCE
+#define CART_PITCH_AXIS_X                 (-0.356F)
+#define CART_PITCH_AXIS_Y                 (-0.934F)
+#define CART_PITCH_AXIS_Z                 (-0.032F)
+#define CART_ROLL_AXIS_X                  (-0.297F)
+#define CART_ROLL_AXIS_Y                  ( 0.145F)
+#define CART_ROLL_AXIS_Z                  (-0.944F)
+#define CART_ORIENTATION_MIN_PROJECTED_MAG (0.10F)
+#define CART_ORIENTATION_FILTER_INIT_CONFIDENCE CART_DUMP_MIN_HIT_CONFIDENCE
 
 /*
  * Allow a latched DUMP to re-arm once the filtered acceleration vector returns
@@ -154,7 +153,7 @@ static bool m_idle_restore_pending;
 static bool m_active;
 static bool m_have_previous_sample;
 static bool m_have_upright_sample;
-static bool m_have_dump_filter;
+static bool m_have_tilt_filter;
 static bool m_dump_candidate;
 static bool m_dump_latched;
 static bool m_dump_armed;
@@ -168,21 +167,16 @@ static float m_upright_y;
 static float m_upright_z;
 static float m_upright_mag;
 
-static float m_dump_filtered_x;
-static float m_dump_filtered_y;
-static float m_dump_filtered_z;
-static float m_dump_filter_alpha;
+static float m_tilt_filtered_x;
+static float m_tilt_filtered_y;
+static float m_tilt_filtered_z;
+static float m_orientation_filter_alpha;
 
-/* Signed-axis shared cart-orientation state plus independent POC DUMP state. */
-static bool m_poc_have_filter;
-static bool m_poc_dump_candidate;
-static bool m_poc_dump_latched;
-static bool m_poc_dump_armed;
-static uint8_t m_poc_dump_candidate_samples;
-static uint8_t m_poc_dump_candidate_hits;
-static uint64_t m_poc_dump_asserted_ms;
-static uint64_t m_poc_dump_min_hold_until_ms;
-static float m_poc_filtered_angle_deg;
+/* Cart-fixed signed orientation filters. */
+static bool m_pitch_have_filter;
+static bool m_roll_have_filter;
+static float m_pitch_filtered_deg;
+static float m_roll_filtered_deg;
 
 static uint64_t m_last_motion_ms;
 static uint64_t m_motion_guard_until_ms;
@@ -251,15 +245,16 @@ static float cart_wrap_signed_angle_deg (float angle_deg)
 }
 
 /*
- * Return the signed cart rotation about the calibrated pivot axis.
- *
- * Acceleration magnitude is deliberately removed before the orientation math:
- * magnitude controls confidence elsewhere; it must not give a high-g impulse
- * extra geometric leverage over the orientation estimate.
+ * Return signed cart rotation about a calibrated cart-fixed axis. Acceleration
+ * magnitude is removed before orientation math; magnitude affects confidence,
+ * not geometric leverage.
  */
-static float cart_poc_signed_angle_deg (const float x,
-                                        const float y,
-                                        const float z)
+static float cart_signed_axis_angle_deg (const float x,
+                                         const float y,
+                                         const float z,
+                                         const float axis_x,
+                                         const float axis_y,
+                                         const float axis_z)
 {
     const float sample_mag = sqrtf ((x * x) + (y * y) + (z * z));
 
@@ -269,18 +264,18 @@ static float cart_poc_signed_angle_deg (const float x,
     }
 
     const float axis_mag =
-        sqrtf ((CART_POC_PIVOT_AXIS_X * CART_POC_PIVOT_AXIS_X) +
-               (CART_POC_PIVOT_AXIS_Y * CART_POC_PIVOT_AXIS_Y) +
-               (CART_POC_PIVOT_AXIS_Z * CART_POC_PIVOT_AXIS_Z));
+        sqrtf ((axis_x * axis_x) +
+               (axis_y * axis_y) +
+               (axis_z * axis_z));
 
     if (axis_mag <= 0.0F)
     {
         return NAN;
     }
 
-    const float ax = CART_POC_PIVOT_AXIS_X / axis_mag;
-    const float ay = CART_POC_PIVOT_AXIS_Y / axis_mag;
-    const float az = CART_POC_PIVOT_AXIS_Z / axis_mag;
+    const float ax = axis_x / axis_mag;
+    const float ay = axis_y / axis_mag;
+    const float az = axis_z / axis_mag;
 
     const float sx = x / sample_mag;
     const float sy = y / sample_mag;
@@ -306,8 +301,8 @@ static float cart_poc_signed_angle_deg (const float x,
     const float upright_projected_mag =
         sqrtf ((upx * upx) + (upy * upy) + (upz * upz));
 
-    if ((sample_projected_mag < CART_POC_MIN_PROJECTED_MAG) ||
-        (upright_projected_mag < CART_POC_MIN_PROJECTED_MAG))
+    if ((sample_projected_mag < CART_ORIENTATION_MIN_PROJECTED_MAG) ||
+        (upright_projected_mag < CART_ORIENTATION_MIN_PROJECTED_MAG))
     {
         return NAN;
     }
@@ -336,7 +331,38 @@ static float cart_poc_signed_angle_deg (const float x,
         cos_angle = -1.0F;
     }
 
-    return atan2f (sin_angle, cos_angle) * (180.0F / M_PI);
+    return cart_wrap_signed_angle_deg (
+        atan2f (sin_angle, cos_angle) * (180.0F / M_PI));
+}
+
+static void cart_signed_angle_filter_update (const float raw_angle_deg,
+                                             const float confidence,
+                                             bool * const p_have_filter,
+                                             float * const p_filtered_angle_deg)
+{
+    if (!isfinite (raw_angle_deg))
+    {
+        return;
+    }
+
+    if (!(*p_have_filter))
+    {
+        if (confidence >= CART_ORIENTATION_FILTER_INIT_CONFIDENCE)
+        {
+            *p_filtered_angle_deg = raw_angle_deg;
+            *p_have_filter = true;
+        }
+        return;
+    }
+
+    const float effective_alpha =
+        m_orientation_filter_alpha * confidence;
+    const float delta_deg =
+        cart_wrap_signed_angle_deg (raw_angle_deg - *p_filtered_angle_deg);
+
+    *p_filtered_angle_deg =
+        cart_wrap_signed_angle_deg (
+            *p_filtered_angle_deg + (effective_alpha * delta_deg));
 }
 
 static void cart_sample_metrics_get (const float x,
@@ -372,9 +398,9 @@ static void cart_sample_metrics_get (const float x,
             m_upright_z);
 }
 
-static bool cart_is_inverted (const float angle_deg)
+static bool cart_is_dump_pitch (const float pitch_deg)
 {
-    return angle_deg >= CART_DUMP_ANGLE_DEG;
+    return fabsf (pitch_deg) >= CART_DUMP_ANGLE_DEG;
 }
 
 static bool cart_is_dump_rearmed (const float angle_deg)
@@ -416,33 +442,6 @@ static uint8_t cart_dump_age_ticks_get (const uint64_t now_ms)
 
     const uint64_t age_ticks =
         (now_ms - m_dump_asserted_ms) / CART_DUMP_AGE_TICK_MS;
-
-    return (uint8_t) ((age_ticks > 0xFFU) ? 0xFFU : age_ticks);
-}
-
-static void cart_poc_dump_candidate_reset (void)
-{
-    m_poc_dump_candidate = false;
-    m_poc_dump_candidate_samples = 0U;
-    m_poc_dump_candidate_hits = 0U;
-}
-
-static void cart_poc_dump_candidate_start (void)
-{
-    m_poc_dump_candidate = true;
-    m_poc_dump_candidate_samples = 1U;
-    m_poc_dump_candidate_hits = 1U;
-}
-
-static uint8_t cart_poc_dump_age_ticks_get (const uint64_t now_ms)
-{
-    if (!m_poc_dump_latched)
-    {
-        return 0U;
-    }
-
-    const uint64_t age_ticks =
-        (now_ms - m_poc_dump_asserted_ms) / CART_DUMP_AGE_TICK_MS;
 
     return (uint8_t) ((age_ticks > 0xFFU) ? 0xFFU : age_ticks);
 }
@@ -502,13 +501,6 @@ static void cart_idle (void * p_event, uint16_t event_size)
         m_dump_armed = true;
     }
 
-    if (m_poc_dump_latched)
-    {
-        m_poc_dump_latched = false;
-        m_poc_dump_asserted_ms = 0U;
-    }
-    cart_poc_dump_candidate_reset();
-    m_poc_dump_armed = true;
 
     /*
      * Stop motion evaluation before taking the final sample so the final
@@ -516,8 +508,9 @@ static void cart_idle (void * p_event, uint16_t event_size)
      */
     m_active = false;
     m_have_previous_sample = false;
-    m_have_dump_filter = false;
-    m_poc_have_filter = false;
+    m_have_tilt_filter = false;
+    m_pitch_have_filter = false;
+    m_roll_have_filter = false;
     m_rolling_candidate = false;
     m_rolling = false;
     m_rolling_evidence_ms = 0U;
@@ -528,7 +521,6 @@ static void cart_idle (void * p_event, uint16_t event_size)
      * the other derived telemetry values.
      */
     m_telemetry.dump_evidence = false;
-    m_telemetry.poc_dump_evidence = false;
     m_telemetry.rolling_evidence = false;
 
     /*
@@ -587,8 +579,9 @@ static void cart_motion (void * p_event, uint16_t event_size)
 
         m_active = true;
         m_have_previous_sample = false;
-        m_have_dump_filter = false;
-        m_poc_have_filter = false;
+        m_have_tilt_filter = false;
+        m_pitch_have_filter = false;
+        m_roll_have_filter = false;
 
         /*
          * Generate fresh telemetry immediately rather than waiting for the
@@ -612,19 +605,16 @@ rd_status_t app_cart_motion_init (void)
         m_active = false;
         m_have_previous_sample = false;
         m_have_upright_sample = false;
-        m_have_dump_filter = false;
-        m_poc_have_filter = false;
+        m_have_tilt_filter = false;
+        m_pitch_have_filter = false;
+        m_roll_have_filter = false;
 
         cart_dump_candidate_reset();
         m_dump_latched = false;
         m_dump_armed = true;
 
-        cart_poc_dump_candidate_reset();
-        m_poc_dump_latched = false;
-        m_poc_dump_armed = true;
-        m_poc_dump_asserted_ms = 0U;
-        m_poc_dump_min_hold_until_ms = 0U;
-        m_poc_filtered_angle_deg = 0.0F;
+        m_pitch_filtered_deg = 0.0F;
+        m_roll_filtered_deg = 0.0F;
 
         m_last_motion_ms = 0U;
         m_motion_guard_until_ms = 0U;
@@ -637,10 +627,10 @@ rd_status_t app_cart_motion_init (void)
         m_last_rolling_motion_ms = 0U;
         m_telemetry = (app_cart_motion_telemetry_t) {0};
 
-        m_dump_filter_alpha =
+        m_orientation_filter_alpha =
             1.0F - expf (
                 -((float) CART_ANALYSIS_INTERVAL_MS) /
-                CART_DUMP_FILTER_TAU_MS);
+                CART_ORIENTATION_FILTER_TAU_MS);
 
         err_code |= ri_timer_create (&m_idle_timer,
                                      RI_TIMER_MODE_SINGLE_SHOT,
@@ -739,7 +729,7 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
         {
             float sample_g;
             float confidence;
-            float angle_deg;
+            float tilt_deg;
 
             cart_sample_metrics_get (
                 x,
@@ -747,7 +737,20 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
                 z,
                 &sample_g,
                 &confidence,
-                &angle_deg);
+                &tilt_deg);
+
+            const float pitch_deg =
+                cart_signed_axis_angle_deg (
+                    x, y, z,
+                    CART_PITCH_AXIS_X,
+                    CART_PITCH_AXIS_Y,
+                    CART_PITCH_AXIS_Z);
+            const float roll_deg =
+                cart_signed_axis_angle_deg (
+                    x, y, z,
+                    CART_ROLL_AXIS_X,
+                    CART_ROLL_AXIS_Y,
+                    CART_ROLL_AXIS_Z);
 
             m_telemetry.valid = true;
             m_telemetry.active = false;
@@ -756,25 +759,22 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
             m_telemetry.dump_latched = m_dump_latched;
             m_telemetry.rolling_candidate = m_rolling_candidate;
             m_telemetry.rolling_evidence = false;
-            m_telemetry.upright = cart_is_upright (angle_deg);
+            m_telemetry.upright = cart_is_upright (tilt_deg);
+            m_telemetry.pitch_valid = isfinite (pitch_deg);
+            m_telemetry.roll_valid = isfinite (roll_deg);
             m_telemetry.status = app_cart_motion_status_get();
             m_telemetry.dump_candidate_hits = m_dump_candidate_hits;
             m_telemetry.dump_candidate_samples = m_dump_candidate_samples;
             m_telemetry.dump_age_ticks = 0U;
             m_telemetry.rolling_evidence_ms = m_rolling_evidence_ms;
-            m_telemetry.raw_angle_deg = angle_deg;
-            m_telemetry.filtered_angle_deg = angle_deg;
+            m_telemetry.tilt_deg = tilt_deg;
+            m_telemetry.tilt_filtered_deg = tilt_deg;
+            m_telemetry.pitch_deg = isfinite (pitch_deg) ? pitch_deg : 0.0F;
+            m_telemetry.pitch_filtered_deg = m_telemetry.pitch_deg;
+            m_telemetry.roll_deg = isfinite (roll_deg) ? roll_deg : 0.0F;
+            m_telemetry.roll_filtered_deg = m_telemetry.roll_deg;
             m_telemetry.sample_g = sample_g;
             m_telemetry.confidence = confidence;
-            m_telemetry.poc_angle_valid = false;
-            m_telemetry.poc_dump_candidate = m_poc_dump_candidate;
-            m_telemetry.poc_dump_evidence = false;
-            m_telemetry.poc_dump_latched = m_poc_dump_latched;
-            m_telemetry.poc_dump_candidate_hits = m_poc_dump_candidate_hits;
-            m_telemetry.poc_dump_candidate_samples = m_poc_dump_candidate_samples;
-            m_telemetry.poc_dump_age_ticks = 0U;
-            m_telemetry.poc_raw_angle_deg = 0.0F;
-            m_telemetry.poc_filtered_angle_deg = 0.0F;
         }
 
         return;
@@ -797,7 +797,7 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
      */
     float sample_g;
     float confidence;
-    float angle_deg;
+    float tilt_deg;
 
     cart_sample_metrics_get (
         x,
@@ -805,85 +805,69 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
         z,
         &sample_g,
         &confidence,
-        &angle_deg);
+        &tilt_deg);
 
-    if (!m_have_dump_filter)
+    if (!m_have_tilt_filter)
     {
-        m_dump_filtered_x = x;
-        m_dump_filtered_y = y;
-        m_dump_filtered_z = z;
-        m_have_dump_filter = true;
+        m_tilt_filtered_x = x;
+        m_tilt_filtered_y = y;
+        m_tilt_filtered_z = z;
+        m_have_tilt_filter = true;
     }
     else
     {
         const float effective_alpha =
-            m_dump_filter_alpha * confidence;
+            m_orientation_filter_alpha * confidence;
 
-        m_dump_filtered_x +=
-            effective_alpha * (x - m_dump_filtered_x);
-        m_dump_filtered_y +=
-            effective_alpha * (y - m_dump_filtered_y);
-        m_dump_filtered_z +=
-            effective_alpha * (z - m_dump_filtered_z);
+        m_tilt_filtered_x +=
+            effective_alpha * (x - m_tilt_filtered_x);
+        m_tilt_filtered_y +=
+            effective_alpha * (y - m_tilt_filtered_y);
+        m_tilt_filtered_z +=
+            effective_alpha * (z - m_tilt_filtered_z);
     }
 
     const float tilt_angle_deg =
         cart_angle_from_reference_deg (
-            m_dump_filtered_x,
-            m_dump_filtered_y,
-            m_dump_filtered_z,
+            m_tilt_filtered_x,
+            m_tilt_filtered_y,
+            m_tilt_filtered_z,
             m_upright_x,
             m_upright_y,
             m_upright_z);
 
     /*
-     * Shared signed-axis cart orientation. The raw signed angle replaces the
-     * generic unsigned angle only as the posture input to ROLLING. UPRIGHT keeps
-     * using total filtered 3-D tilt from the homed upright vector so side lean
-     * remains visible. Existing thresholds and state-machine timing are unchanged.
+     * Cart-fixed orientation coordinates. Pitch is forward/backward rotation;
+     * roll is left/right side rotation. Both use wrap-aware circular filtering.
+     * UPRIGHT remains based on total filtered 3-D tilt so lean on any axis counts.
      */
-    const float poc_raw_angle_deg =
-        cart_poc_signed_angle_deg (x, y, z);
-    const bool poc_raw_angle_valid = isfinite (poc_raw_angle_deg);
+    const float pitch_deg =
+        cart_signed_axis_angle_deg (
+            x, y, z,
+            CART_PITCH_AXIS_X,
+            CART_PITCH_AXIS_Y,
+            CART_PITCH_AXIS_Z);
+    const float roll_deg =
+        cart_signed_axis_angle_deg (
+            x, y, z,
+            CART_ROLL_AXIS_X,
+            CART_ROLL_AXIS_Y,
+            CART_ROLL_AXIS_Z);
 
-    if (poc_raw_angle_valid)
-    {
-        if (!m_poc_have_filter)
-        {
-            /*
-             * Do not seed the shared orientation filter from a low-confidence
-             * first motion sample.  The 13:42 false-positive capture showed
-             * exactly that failure mode: a high-g impulse occurred before the
-             * first trustworthy near-upright sample.
-             */
-            if (confidence >= CART_POC_FILTER_INIT_CONFIDENCE)
-            {
-                m_poc_filtered_angle_deg = poc_raw_angle_deg;
-                m_poc_have_filter = true;
-            }
-        }
-        else
-        {
-            const float effective_alpha =
-                m_dump_filter_alpha * confidence;
-            const float delta_deg =
-                cart_wrap_signed_angle_deg (
-                    poc_raw_angle_deg - m_poc_filtered_angle_deg);
+    const bool pitch_valid = isfinite (pitch_deg);
+    const bool roll_valid = isfinite (roll_deg);
 
-            m_poc_filtered_angle_deg =
-                cart_wrap_signed_angle_deg (
-                    m_poc_filtered_angle_deg +
-                    (effective_alpha * delta_deg));
-        }
-    }
-
-    const bool inverted =
-        cart_is_inverted (tilt_angle_deg);
+    cart_signed_angle_filter_update (
+        pitch_deg, confidence, &m_pitch_have_filter, &m_pitch_filtered_deg);
+    cart_signed_angle_filter_update (
+        roll_deg, confidence, &m_roll_have_filter, &m_roll_filtered_deg);
 
     const bool dump_evidence =
-        inverted &&
+        m_pitch_have_filter &&
+        cart_is_dump_pitch (m_pitch_filtered_deg) &&
         (confidence >= CART_DUMP_MIN_HIT_CONFIDENCE);
 
+    /* Require a return toward true 3-D upright before re-arming a DUMP. */
     const bool dump_rearmed =
         cart_is_dump_rearmed (tilt_angle_deg);
 
@@ -891,7 +875,7 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
         cart_is_upright (tilt_angle_deg);
 
     const float rolling_angle_deg =
-        poc_raw_angle_valid ? fabsf (poc_raw_angle_deg) : angle_deg;
+        pitch_valid ? fabsf (pitch_deg) : tilt_deg;
     const bool rolling =
         cart_is_rolling (rolling_angle_deg);
 
@@ -967,67 +951,6 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
             }
         }
     }
-    /* Independent POC DUMP detector consumes the shared signed orientation. */
-    const bool poc_dump_evidence =
-        m_poc_have_filter &&
-        (m_poc_filtered_angle_deg >= CART_DUMP_ANGLE_DEG) &&
-        (confidence >= CART_DUMP_MIN_HIT_CONFIDENCE);
-
-    const bool poc_dump_rearmed =
-        m_poc_have_filter &&
-        (fabsf (m_poc_filtered_angle_deg) <= CART_DUMP_REARM_ANGLE_DEG);
-
-    if (m_poc_dump_latched)
-    {
-        if ((now_ms >= m_poc_dump_min_hold_until_ms) && poc_dump_rearmed)
-        {
-            m_poc_dump_latched = false;
-            m_poc_dump_asserted_ms = 0U;
-            m_poc_dump_armed = true;
-        }
-    }
-    else if (m_poc_dump_armed)
-    {
-        if (!m_poc_dump_candidate)
-        {
-            if (poc_dump_evidence)
-            {
-                cart_poc_dump_candidate_start();
-            }
-        }
-        else
-        {
-            m_poc_dump_candidate_samples++;
-
-            if (poc_dump_evidence)
-            {
-                m_poc_dump_candidate_hits++;
-            }
-
-            if (m_poc_dump_candidate_samples >= CART_DUMP_CONFIRM_SAMPLES)
-            {
-                if (m_poc_dump_candidate_hits >= CART_DUMP_REQUIRED_HITS)
-                {
-                    cart_poc_dump_candidate_reset();
-                    m_poc_dump_latched = true;
-                    m_poc_dump_asserted_ms = now_ms;
-                    m_poc_dump_armed = false;
-                    m_poc_dump_min_hold_until_ms =
-                        now_ms + CART_DUMP_ACTIVE_HOLD_MS;
-                }
-                else
-                {
-                    cart_poc_dump_candidate_reset();
-
-                    if (poc_dump_evidence)
-                    {
-                        cart_poc_dump_candidate_start();
-                    }
-                }
-            }
-        }
-    }
-
     if (m_have_previous_sample)
     {
         const float dx = x - m_previous_x;
@@ -1107,26 +1030,23 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
     m_telemetry.rolling_candidate = m_rolling_candidate;
     m_telemetry.rolling_evidence = rolling_evidence;
     m_telemetry.upright = upright;
+    m_telemetry.pitch_valid = pitch_valid;
+    m_telemetry.roll_valid = roll_valid;
     m_telemetry.status = app_cart_motion_status_get();
     m_telemetry.dump_candidate_hits = m_dump_candidate_hits;
     m_telemetry.dump_candidate_samples = m_dump_candidate_samples;
     m_telemetry.dump_age_ticks = cart_dump_age_ticks_get (now_ms);
     m_telemetry.rolling_evidence_ms = m_rolling_evidence_ms;
-    m_telemetry.raw_angle_deg = angle_deg;
-    m_telemetry.filtered_angle_deg = tilt_angle_deg;
+    m_telemetry.tilt_deg = tilt_deg;
+    m_telemetry.tilt_filtered_deg = tilt_angle_deg;
+    m_telemetry.pitch_deg = pitch_valid ? pitch_deg : 0.0F;
+    m_telemetry.pitch_filtered_deg =
+        m_pitch_have_filter ? m_pitch_filtered_deg : 0.0F;
+    m_telemetry.roll_deg = roll_valid ? roll_deg : 0.0F;
+    m_telemetry.roll_filtered_deg =
+        m_roll_have_filter ? m_roll_filtered_deg : 0.0F;
     m_telemetry.sample_g = sample_g;
     m_telemetry.confidence = confidence;
-    m_telemetry.poc_angle_valid = m_poc_have_filter && poc_raw_angle_valid;
-    m_telemetry.poc_dump_candidate = m_poc_dump_candidate;
-    m_telemetry.poc_dump_evidence = poc_dump_evidence;
-    m_telemetry.poc_dump_latched = m_poc_dump_latched;
-    m_telemetry.poc_dump_candidate_hits = m_poc_dump_candidate_hits;
-    m_telemetry.poc_dump_candidate_samples = m_poc_dump_candidate_samples;
-    m_telemetry.poc_dump_age_ticks = cart_poc_dump_age_ticks_get (now_ms);
-    m_telemetry.poc_raw_angle_deg =
-        poc_raw_angle_valid ? poc_raw_angle_deg : 0.0F;
-    m_telemetry.poc_filtered_angle_deg =
-        m_poc_have_filter ? m_poc_filtered_angle_deg : 0.0F;
 
     m_previous_x = x;
     m_previous_y = y;
@@ -1173,13 +1093,5 @@ bool app_cart_motion_telemetry_get (
     p_telemetry->dump_age_ticks =
         cart_dump_age_ticks_get (now_ms);
     p_telemetry->rolling_evidence_ms = m_rolling_evidence_ms;
-    p_telemetry->poc_angle_valid =
-        m_poc_have_filter && m_telemetry.poc_angle_valid;
-    p_telemetry->poc_dump_candidate = m_poc_dump_candidate;
-    p_telemetry->poc_dump_latched = m_poc_dump_latched;
-    p_telemetry->poc_dump_candidate_hits = m_poc_dump_candidate_hits;
-    p_telemetry->poc_dump_candidate_samples = m_poc_dump_candidate_samples;
-    p_telemetry->poc_dump_age_ticks =
-        cart_poc_dump_age_ticks_get (now_ms);
     return m_telemetry.valid;
 }
