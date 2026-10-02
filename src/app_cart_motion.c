@@ -38,15 +38,16 @@
 #define CART_DUMP_AGE_TICK_MS       (100U)
 
 /*
- * Consider the cart inverted when its acceleration vector is at least
- * CART_DUMP_ANGLE_DEG from the upright reference vector.
+ * DUMP posture requires rotation of at least CART_DUMP_ANGLE_DEG about the
+ * calibrated pitch axis. Either forward or backward inversion is valid.
  */
 #define CART_DUMP_ANGLE_DEG         (135.0F)
 
 
 /*
- * Time constant for the low-pass filter used to estimate cart orientation
- * for DUMP/upright detection.
+ * Time constant for the low-pass filter used to estimate the cart's gravity /
+ * orientation vector. Filtered 3-D tilt, pitch, and roll are all derived from
+ * this same vector estimate.
  *
  * The effective EMA coefficient is calculated from the active sample interval:
  *
@@ -115,7 +116,6 @@
 #define CART_ROLL_AXIS_Y                  ( 0.145F)
 #define CART_ROLL_AXIS_Z                  (-0.944F)
 #define CART_ORIENTATION_MIN_PROJECTED_MAG (0.10F)
-#define CART_ORIENTATION_FILTER_INIT_CONFIDENCE CART_DUMP_MIN_HIT_CONFIDENCE
 
 /*
  * Allow a latched DUMP to re-arm once the filtered acceleration vector returns
@@ -171,12 +171,6 @@ static float m_tilt_filtered_x;
 static float m_tilt_filtered_y;
 static float m_tilt_filtered_z;
 static float m_orientation_filter_alpha;
-
-/* Cart-fixed signed orientation filters. */
-static bool m_pitch_have_filter;
-static bool m_roll_have_filter;
-static float m_pitch_filtered_deg;
-static float m_roll_filtered_deg;
 
 static uint64_t m_last_motion_ms;
 static uint64_t m_motion_guard_until_ms;
@@ -335,36 +329,6 @@ static float cart_signed_axis_angle_deg (const float x,
         atan2f (sin_angle, cos_angle) * (180.0F / M_PI));
 }
 
-static void cart_signed_angle_filter_update (const float raw_angle_deg,
-                                             const float confidence,
-                                             bool * const p_have_filter,
-                                             float * const p_filtered_angle_deg)
-{
-    if (!isfinite (raw_angle_deg))
-    {
-        return;
-    }
-
-    if (!(*p_have_filter))
-    {
-        if (confidence >= CART_ORIENTATION_FILTER_INIT_CONFIDENCE)
-        {
-            *p_filtered_angle_deg = raw_angle_deg;
-            *p_have_filter = true;
-        }
-        return;
-    }
-
-    const float effective_alpha =
-        m_orientation_filter_alpha * confidence;
-    const float delta_deg =
-        cart_wrap_signed_angle_deg (raw_angle_deg - *p_filtered_angle_deg);
-
-    *p_filtered_angle_deg =
-        cart_wrap_signed_angle_deg (
-            *p_filtered_angle_deg + (effective_alpha * delta_deg));
-}
-
 static void cart_sample_metrics_get (const float x,
                                      const float y,
                                      const float z,
@@ -509,8 +473,6 @@ static void cart_idle (void * p_event, uint16_t event_size)
     m_active = false;
     m_have_previous_sample = false;
     m_have_tilt_filter = false;
-    m_pitch_have_filter = false;
-    m_roll_have_filter = false;
     m_rolling_candidate = false;
     m_rolling = false;
     m_rolling_evidence_ms = 0U;
@@ -580,8 +542,6 @@ static void cart_motion (void * p_event, uint16_t event_size)
         m_active = true;
         m_have_previous_sample = false;
         m_have_tilt_filter = false;
-        m_pitch_have_filter = false;
-        m_roll_have_filter = false;
 
         /*
          * Generate fresh telemetry immediately rather than waiting for the
@@ -606,15 +566,10 @@ rd_status_t app_cart_motion_init (void)
         m_have_previous_sample = false;
         m_have_upright_sample = false;
         m_have_tilt_filter = false;
-        m_pitch_have_filter = false;
-        m_roll_have_filter = false;
 
         cart_dump_candidate_reset();
         m_dump_latched = false;
         m_dump_armed = true;
-
-        m_pitch_filtered_deg = 0.0F;
-        m_roll_filtered_deg = 0.0F;
 
         m_last_motion_ms = 0U;
         m_motion_guard_until_ms = 0U;
@@ -791,9 +746,10 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
     const uint64_t now_ms = ri_rtc_millis();
 
     /*
-     * Use a low-pass filtered acceleration vector for DUMP orientation so
-     * short wheel impacts and vibration cannot dominate the gravity estimate.
-     * ROLLING and sample-to-sample motion continue to use the raw XYZ values.
+     * Low-pass the physical XYZ acceleration vector before deriving filtered
+     * orientation. This is the gravity/orientation estimate used for filtered
+     * tilt, pitch, and roll. Raw XYZ remains authoritative for sample-to-sample
+     * physical movement evidence.
      */
     float sample_g;
     float confidence;
@@ -837,9 +793,14 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
             m_upright_z);
 
     /*
-     * Cart-fixed orientation coordinates. Pitch is forward/backward rotation;
-     * roll is left/right side rotation. Both use wrap-aware circular filtering.
-     * UPRIGHT remains based on total filtered 3-D tilt so lean on any axis counts.
+     * Cart-fixed orientation coordinates. Raw pitch/roll are derived directly
+     * from the current sample for diagnostics. Filtered pitch/roll are derived
+     * from the already low-pass-filtered XYZ orientation vector above. This
+     * preserves acceleration magnitude during filtering and only normalizes /
+     * projects after the gravity estimate has been smoothed.
+     *
+     * UPRIGHT and DUMP re-arm continue to use total filtered 3-D tilt so lean
+     * on any axis still counts for those posture decisions.
      */
     const float pitch_deg =
         cart_signed_axis_angle_deg (
@@ -854,17 +815,31 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
             CART_ROLL_AXIS_Y,
             CART_ROLL_AXIS_Z);
 
+    const float pitch_filtered_deg =
+        cart_signed_axis_angle_deg (
+            m_tilt_filtered_x,
+            m_tilt_filtered_y,
+            m_tilt_filtered_z,
+            CART_PITCH_AXIS_X,
+            CART_PITCH_AXIS_Y,
+            CART_PITCH_AXIS_Z);
+    const float roll_filtered_deg =
+        cart_signed_axis_angle_deg (
+            m_tilt_filtered_x,
+            m_tilt_filtered_y,
+            m_tilt_filtered_z,
+            CART_ROLL_AXIS_X,
+            CART_ROLL_AXIS_Y,
+            CART_ROLL_AXIS_Z);
+
     const bool pitch_valid = isfinite (pitch_deg);
     const bool roll_valid = isfinite (roll_deg);
-
-    cart_signed_angle_filter_update (
-        pitch_deg, confidence, &m_pitch_have_filter, &m_pitch_filtered_deg);
-    cart_signed_angle_filter_update (
-        roll_deg, confidence, &m_roll_have_filter, &m_roll_filtered_deg);
+    const bool pitch_filtered_valid = isfinite (pitch_filtered_deg);
+    const bool roll_filtered_valid = isfinite (roll_filtered_deg);
 
     const bool dump_evidence =
-        m_pitch_have_filter &&
-        cart_is_dump_pitch (m_pitch_filtered_deg) &&
+        pitch_filtered_valid &&
+        cart_is_dump_pitch (pitch_filtered_deg) &&
         (confidence >= CART_DUMP_MIN_HIT_CONFIDENCE);
 
     /* Require a return toward true 3-D upright before re-arming a DUMP. */
@@ -875,8 +850,8 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
         cart_is_upright (tilt_angle_deg);
 
     const bool rolling =
-        m_pitch_have_filter &&
-        cart_is_rolling (fabsf (m_pitch_filtered_deg));
+        pitch_filtered_valid &&
+        cart_is_rolling (fabsf (pitch_filtered_deg));
 
     bool rolling_evidence = false;
 
@@ -1040,10 +1015,10 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
     m_telemetry.tilt_filtered_deg = tilt_angle_deg;
     m_telemetry.pitch_deg = pitch_valid ? pitch_deg : 0.0F;
     m_telemetry.pitch_filtered_deg =
-        m_pitch_have_filter ? m_pitch_filtered_deg : 0.0F;
+        pitch_filtered_valid ? pitch_filtered_deg : 0.0F;
     m_telemetry.roll_deg = roll_valid ? roll_deg : 0.0F;
     m_telemetry.roll_filtered_deg =
-        m_roll_have_filter ? m_roll_filtered_deg : 0.0F;
+        roll_filtered_valid ? roll_filtered_deg : 0.0F;
     m_telemetry.sample_g = sample_g;
     m_telemetry.confidence = confidence;
 
