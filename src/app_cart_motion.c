@@ -38,8 +38,8 @@
 #define CART_DUMP_AGE_TICK_MS       (100U)
 
 /*
- * DUMP posture requires rotation of at least CART_DUMP_ANGLE_DEG about the
- * calibrated pitch axis. Either forward or backward inversion is valid.
+ * DUMP posture requires total filtered 3-D inversion of at least
+ * CART_DUMP_ANGLE_DEG from the learned upright reference vector.
  */
 #define CART_DUMP_ANGLE_DEG         (135.0F)
 
@@ -85,7 +85,7 @@
  * learned stationary upright magnitude, so 1.0 g reflects this tag's own
  * measured baseline rather than a hard-coded standard-gravity constant.
  * Leave samples at or below the onset threshold fully trusted, then
- * exponentially reduce their influence on the DUMP EMA. Low-g samples remain
+ * exponentially reduce their influence on the orientation EMA. Low-g samples remain
  * fully trusted because representative dump events can legitimately contain
  * brief low-g phases.
  *
@@ -362,9 +362,9 @@ static void cart_sample_metrics_get (const float x,
             m_upright_z);
 }
 
-static bool cart_is_dump_pitch (const float pitch_deg)
+static bool cart_is_inverted (const float angle_deg)
 {
-    return fabsf (pitch_deg) >= CART_DUMP_ANGLE_DEG;
+    return angle_deg >= CART_DUMP_ANGLE_DEG;
 }
 
 static bool cart_is_dump_rearmed (const float angle_deg)
@@ -838,8 +838,7 @@ void app_cart_motion_on_sample (const rd_sensor_data_t * const p_data)
     const bool roll_filtered_valid = isfinite (roll_filtered_deg);
 
     const bool dump_evidence =
-        pitch_filtered_valid &&
-        cart_is_dump_pitch (pitch_filtered_deg) &&
+        cart_is_inverted (tilt_angle_deg) &&
         (confidence >= CART_DUMP_MIN_HIT_CONFIDENCE);
 
     /* Require a return toward true 3-D upright before re-arming a DUMP. */
